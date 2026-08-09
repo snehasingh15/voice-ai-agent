@@ -18,12 +18,20 @@ streaming STT path (Deepgram Realtime).
 import json
 from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .multimodal.vision import analyze_image
 from .pipeline.orchestrator import add_image_to_session_history, handle_audio_turn, _save_session_memory
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # Serve a minimal static frontend (optional convenience)
 frontend_dir = Path(__file__).resolve().parents[1] / ".." / "frontend"
@@ -110,9 +118,11 @@ async def upload_image(caller_id: str = Form(...), image: UploadFile = File(...)
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Uploaded image is empty")
 
-    description = analyze_image(image_bytes, image.content_type)
-    if not description:
-        raise HTTPException(status_code=500, detail="Failed to analyze image")
+    try:
+        description = analyze_image(image_bytes, image.content_type)
+    except Exception as exc:
+        print(f"[vision] analyze_image failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Image analysis failed: {exc}")
 
     add_image_to_session_history(caller_id, description)
     return {"description": description}

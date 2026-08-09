@@ -8,6 +8,8 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Gemini (Google) embeddings API key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Gemini text/multimodal model for image understanding
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "models/gemini-3.6-flash")
 # MongoDB connection URI (Atlas)
 MONGODB_URI = os.getenv("MONGODB_URI")
 # MongoDB database name if not included in the URI
