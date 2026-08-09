@@ -3,4 +3,10 @@ uvicorn
 python-dotenv
 deepgram-sdk
 edge-tts
+groq
 websockets
+pymongo
+dnspython
+certifi
+requests
+google-genai

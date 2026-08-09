@@ -1,5 +1,6 @@
 import json
 import asyncio
+import urllib.error
 import urllib.request
 
 from ..config import DEEPGRAM_API_KEY
@@ -25,8 +26,8 @@ async def transcribe_audio(audio_bytes: bytes, mime: str = "audio/webm") -> str:
             return resp.read()
 
     loop = asyncio.get_event_loop()
-    raw = await loop.run_in_executor(None, do_request)
     try:
+        raw = await loop.run_in_executor(None, do_request)
         data = json.loads(raw.decode("utf-8"))
         transcript = (
             data.get("results", {})
@@ -35,5 +36,10 @@ async def transcribe_audio(audio_bytes: bytes, mime: str = "audio/webm") -> str:
             .get("transcript", "")
         )
         return transcript
-    except Exception:
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        print(f"[stt] Deepgram HTTPError {exc.code}: {exc.reason}; body={body}")
+        return ""
+    except Exception as exc:
+        print(f"[stt] audio transcription failed: {exc}")
         return ""

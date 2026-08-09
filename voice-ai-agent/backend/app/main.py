@@ -36,9 +36,14 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     audio_buffer = bytearray()
     mime = "audio/webm"
+    session_id = f"session-{id(websocket)}"
     try:
         while True:
             msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                print(f"WebSocket disconnected cleanly: {msg}")
+                break
+
             # Distinguish between text and binary messages
             if "text" in msg:
                 try:
@@ -54,7 +59,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg_type == "stop":
                     await websocket.send_json({"type": "status", "message": "processing"})
                     # process buffer in background
-                    transcript, reply_text, tts_audio = await handle_audio_turn(bytes(audio_buffer), mime=mime)
+                    transcript, reply_text, tts_audio = await handle_audio_turn(
+                        bytes(audio_buffer),
+                        mime=mime,
+                        session_id=session_id,
+                        tool_event_callback=lambda event: websocket.send_json({"type": "tool_status", "tool": event["tool"], "args": event["args"], "status": event["status"]}),
+                    )
 
                     await websocket.send_json({"type": "transcript", "text": transcript})
                     await websocket.send_json({"type": "reply", "text": reply_text})
@@ -72,4 +82,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # unknown message shape
                 pass
     except WebSocketDisconnect:
+        print("WebSocket disconnect exception caught")
+    except Exception as exc:
+        print(f"WebSocket loop error: {exc}")
+    finally:
         return
