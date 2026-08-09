@@ -16,12 +16,12 @@ streaming STT path (Deepgram Realtime).
 """
 
 import json
-import os
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from .pipeline.orchestrator import handle_audio_turn
+from .multimodal.vision import analyze_image
+from .pipeline.orchestrator import add_image_to_session_history, handle_audio_turn, _save_session_memory
 
 app = FastAPI()
 
@@ -36,7 +36,8 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     audio_buffer = bytearray()
     mime = "audio/webm"
-    session_id = f"session-{id(websocket)}"
+    caller_id = None
+    session_id = None
     try:
         while True:
             msg = await websocket.receive()
@@ -52,7 +53,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     data = {}
 
                 msg_type = data.get("type")
-                if msg_type == "start":
+                if msg_type == "session_start":
+                    caller_id = data.get("caller_id", "anonymous") or "anonymous"
+                    session_id = f"session-{caller_id}"
+                    await websocket.send_json({"type": "status", "message": "session_started"})
+                elif msg_type == "start":
+                    if session_id is None:
+                        caller_id = caller_id or "anonymous"
+                        session_id = f"session-{caller_id}"
                     mime = data.get("mimeType", mime)
                     audio_buffer = bytearray()
                     await websocket.send_json({"type": "status", "message": "recording_started"})
@@ -86,4 +94,25 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as exc:
         print(f"WebSocket loop error: {exc}")
     finally:
+        if session_id is not None:
+            _save_session_memory(session_id)
         return
+
+
+@app.post("/api/upload-image")
+async def upload_image(caller_id: str = Form(...), image: UploadFile = File(...)):
+    if not caller_id:
+        raise HTTPException(status_code=400, detail="caller_id is required")
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="A valid image file is required")
+
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty")
+
+    description = analyze_image(image_bytes, image.content_type)
+    if not description:
+        raise HTTPException(status_code=500, detail="Failed to analyze image")
+
+    add_image_to_session_history(caller_id, description)
+    return {"description": description}

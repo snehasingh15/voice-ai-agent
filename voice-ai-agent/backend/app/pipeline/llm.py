@@ -29,8 +29,19 @@ def _call_tool_function(tool_name: str, arguments: dict[str, Any], event_callbac
     return f"Tool {tool_name} not implemented"
 
 
-def _build_messages(user_text: str, history: list[dict[str, str]], tool_definitions: list[dict] | None = None) -> list[dict[str, Any]]:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+def _build_messages(
+    user_text: str,
+    history: list[dict[str, str]],
+    tool_definitions: list[dict] | None = None,
+    caller_summary: str | None = None,
+) -> list[dict[str, Any]]:
+    system_prompt = SYSTEM_PROMPT
+    if caller_summary:
+        system_prompt = (
+            f"{SYSTEM_PROMPT} What you remember about this caller: {caller_summary}"
+        )
+
+    messages = [{"role": "system", "content": system_prompt}]
     for item in history:
         messages.append({"role": item["role"], "content": item["content"]})
     messages.append({"role": "user", "content": user_text})
@@ -43,6 +54,7 @@ def generate_agent_reply(
     tool_definitions: list[dict] | None = None,
     client: Any | None = None,
     event_callback: Any | None = None,
+    caller_summary: str | None = None,
 ) -> str:
     """Call Groq with tool use support; execute tools when requested and return final text."""
     if client is None:
@@ -54,7 +66,7 @@ def generate_agent_reply(
     if tool_definitions is None:
         tool_definitions = get_tool_definitions()
 
-    messages = _build_messages(user_text, history, tool_definitions)
+    messages = _build_messages(user_text, history, tool_definitions, caller_summary=caller_summary)
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=messages,
@@ -94,3 +106,46 @@ def generate_agent_reply(
     )
     follow_up_message = follow_up_response.choices[0].message
     return getattr(follow_up_message, "content", "") or ""
+
+
+def summarize_conversation(history: list[dict[str, str]]) -> str:
+    if not history:
+        return ""
+
+    conversation_lines = []
+    for item in history:
+        role = item.get("role", "unknown")
+        content = item.get("content", "")
+        if role == "user":
+            conversation_lines.append(f"Caller: {content}")
+        elif role == "assistant":
+            conversation_lines.append(f"Assistant: {content}")
+        else:
+            conversation_lines.append(f"{role.capitalize()}: {content}")
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a concise summarization assistant."
+        },
+        {
+            "role": "user",
+            "content": (
+                "Summarize the key facts about this caller and what they discussed, "
+                "in 2-3 sentences, for future reference.\n\n"
+                "Conversation:\n"
+                + "\n".join(conversation_lines)
+            ),
+        },
+    ]
+
+    api_key = GROQ_API_KEY
+    if not api_key:
+        return ""
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        temperature=0.2,
+    )
+    return getattr(response.choices[0].message, "content", "") or ""
