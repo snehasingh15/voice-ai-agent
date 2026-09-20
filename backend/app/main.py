@@ -76,6 +76,20 @@ if _frontend_dir.exists():
     app.mount("/frontend", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
 
 
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "service": "Voice AI Enterprise API",
+        "docs": "/docs",
+        "health": "/healthz",
+    }
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "status": "healthy"}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
