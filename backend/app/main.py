@@ -444,21 +444,30 @@ async def delete_prompt(prompt_id: str, admin: dict = Depends(get_current_admin)
 
 @app.get("/api/doctors")
 async def doctors(department: str = ""):
-    seed_default_doctors(False)
-    query = {"department": {"$regex": f"^{department}$", "$options": "i"}} if department else {}
-    docs = list(get_db().get_collection("doctors").find(query).sort("doctorName", 1).limit(200))
-    return [_serialize_doc(doc) for doc in docs]
+    try:
+        seed_default_doctors(False)
+        query = {"department": {"$regex": f"^{department}$", "$options": "i"}} if department else {}
+        docs = list(get_db().get_collection("doctors").find(query).sort("doctorName", 1).limit(200))
+        return [_serialize_doc(doc) for doc in docs]
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
 
 
 @app.post("/api/admin/seed-doctors")
 async def seed_doctors(admin: dict = Depends(get_current_admin)):
-    return json.loads(seed_default_doctors(force=True))
+    try:
+        return json.loads(seed_default_doctors(force=True))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unavailable. Check MONGODB_URI and MongoDB Atlas network access: {exc}")
 
 
 @app.post("/api/admin/seed-demo-data")
 async def seed_demo_data(admin: dict = Depends(get_current_admin)):
-    seed_default_doctors(force=False)
-    return {"ok": True, "message": "Demo data seeded successfully."}
+    try:
+        seed_default_doctors(force=False)
+        return {"ok": True, "message": "Demo data seeded successfully."}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unavailable. Check MONGODB_URI and MongoDB Atlas network access: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

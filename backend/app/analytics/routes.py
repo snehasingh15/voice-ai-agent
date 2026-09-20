@@ -6,58 +6,55 @@ from ..limiter import limiter
 router = APIRouter(prefix="/api/analytics")
 
 
+def _empty_summary(database_error: str | None = None):
+    payload = {
+        "total_calls": 0,
+        "avg_stt_latency_ms": 0,
+        "avg_llm_latency_ms": 0,
+        "avg_tts_latency_ms": 0,
+        "sentiment_breakdown": {"positive": 0, "neutral": 0, "negative": 0},
+        "most_used_tools": [],
+    }
+    if database_error:
+        payload["database_error"] = database_error
+    return payload
+
+
 @router.get("/summary")
 @limiter.limit("30/minute")
 async def analytics_summary(request: Request):
-    db = get_db()
-    collection = db.get_collection("call_logs")
-
-    pipeline = [
-        {
-            "$facet": {
-                "summary": [
-                    {
-                        "$group": {
-                            "_id": None,
-                            "total_calls": {"$sum": 1},
-                            "avg_stt_latency_ms": {"$avg": "$stt_latency_ms"},
-                            "avg_llm_latency_ms": {"$avg": "$llm_latency_ms"},
-                            "avg_tts_latency_ms": {"$avg": "$tts_latency_ms"},
+    try:
+        collection = get_db().get_collection("call_logs")
+        result = list(collection.aggregate([
+            {
+                "$facet": {
+                    "summary": [
+                        {
+                            "$group": {
+                                "_id": None,
+                                "total_calls": {"$sum": 1},
+                                "avg_stt_latency_ms": {"$avg": "$stt_latency_ms"},
+                                "avg_llm_latency_ms": {"$avg": "$llm_latency_ms"},
+                                "avg_tts_latency_ms": {"$avg": "$tts_latency_ms"},
+                            }
                         }
-                    }
-                ],
-                "sentiment_counts": [
-                    {
-                        "$group": {
-                            "_id": "$sentiment",
-                            "count": {"$sum": 1},
-                        }
-                    }
-                ],
-                "tool_counts": [
-                    {
-                        "$group": {
-                            "_id": "$tool_used",
-                            "count": {"$sum": 1},
-                        }
-                    },
-                    {"$sort": {"count": -1}},
-                    {"$limit": 5},
-                ],
+                    ],
+                    "sentiment_counts": [
+                        {"$group": {"_id": "$sentiment", "count": {"$sum": 1}}}
+                    ],
+                    "tool_counts": [
+                        {"$group": {"_id": "$tool_used", "count": {"$sum": 1}}},
+                        {"$sort": {"count": -1}},
+                        {"$limit": 5},
+                    ],
+                }
             }
-        }
-    ]
+        ]))
+    except Exception as exc:
+        return _empty_summary(str(exc))
 
-    result = list(collection.aggregate(pipeline))
     if not result:
-        return {
-            "total_calls": 0,
-            "avg_stt_latency_ms": 0,
-            "avg_llm_latency_ms": 0,
-            "avg_tts_latency_ms": 0,
-            "sentiment_breakdown": {"positive": 0, "neutral": 0, "negative": 0},
-            "most_used_tools": [],
-        }
+        return _empty_summary()
 
     summary = result[0].get("summary", [])
     sentiment_counts = result[0].get("sentiment_counts", [])
@@ -66,9 +63,9 @@ async def analytics_summary(request: Request):
     if summary:
         summary_doc = summary[0]
         total_calls = summary_doc.get("total_calls", 0)
-        avg_stt_latency_ms = summary_doc.get("avg_stt_latency_ms", 0)
-        avg_llm_latency_ms = summary_doc.get("avg_llm_latency_ms", 0)
-        avg_tts_latency_ms = summary_doc.get("avg_tts_latency_ms", 0)
+        avg_stt_latency_ms = summary_doc.get("avg_stt_latency_ms") or 0
+        avg_llm_latency_ms = summary_doc.get("avg_llm_latency_ms") or 0
+        avg_tts_latency_ms = summary_doc.get("avg_tts_latency_ms") or 0
     else:
         total_calls = 0
         avg_stt_latency_ms = 0
@@ -77,10 +74,10 @@ async def analytics_summary(request: Request):
 
     sentiment_breakdown = {"positive": 0, "neutral": 0, "negative": 0}
     for sentiment in sentiment_counts:
-        sentiment_breakdown[sentiment.get("_id", "neutral")] = sentiment.get("count", 0)
+        sentiment_breakdown[sentiment.get("_id") or "neutral"] = sentiment.get("count", 0)
 
     most_used_tools = [
-        {"tool": item.get("_id", "unknown"), "count": item.get("count", 0)}
+        {"tool": item.get("_id") or "unknown", "count": item.get("count", 0)}
         for item in tool_counts
     ]
 
@@ -97,44 +94,44 @@ async def analytics_summary(request: Request):
 @router.get("/recent")
 @limiter.limit("30/minute")
 async def analytics_recent(request: Request):
-    db = get_db()
-    collection = db.get_collection("call_logs")
-    recent = list(
-        collection.find(
-            {},
-            {
-                "_id": 0,
-                "caller_id": 1,
-                "session_id": 1,
-                "transcript": 1,
-                "reply_text": 1,
-                "stt_latency_ms": 1,
-                "llm_latency_ms": 1,
-                "tts_latency_ms": 1,
-                "tool_used": 1,
-                "sentiment": 1,
-                "timestamp": 1,
-            },
+    try:
+        collection = get_db().get_collection("call_logs")
+        return list(
+            collection.find(
+                {},
+                {
+                    "_id": 0,
+                    "caller_id": 1,
+                    "session_id": 1,
+                    "transcript": 1,
+                    "reply_text": 1,
+                    "stt_latency_ms": 1,
+                    "llm_latency_ms": 1,
+                    "tts_latency_ms": 1,
+                    "tool_used": 1,
+                    "sentiment": 1,
+                    "timestamp": 1,
+                },
+            )
+            .sort("timestamp", -1)
+            .limit(20)
         )
-        .sort("timestamp", -1)
-        .limit(20)
-    )
-    return recent
-
+    except Exception:
+        return []
 
 
 @router.get("/bookings")
 @limiter.limit("30/minute")
 async def analytics_bookings(request: Request):
-    db = get_db()
-    collection = db.get_collection("call_logs")
-    # Return calls where a tool was used (tool_used != "none")
-    bookings = list(
-        collection.find(
-            {"tool_used": {"$ne": "none"}},
-            {"_id": 0, "timestamp": 1, "caller_id": 1, "tool_used": 1, "reply_text": 1, "transcript": 1},
+    try:
+        collection = get_db().get_collection("call_logs")
+        return list(
+            collection.find(
+                {"tool_used": {"$ne": "none"}},
+                {"_id": 0, "timestamp": 1, "caller_id": 1, "tool_used": 1, "reply_text": 1, "transcript": 1},
+            )
+            .sort("timestamp", -1)
+            .limit(200)
         )
-        .sort("timestamp", -1)
-        .limit(200)
-    )
-    return bookings
+    except Exception:
+        return []
