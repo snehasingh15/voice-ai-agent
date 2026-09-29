@@ -10,28 +10,24 @@ def get_client() -> MongoClient:
     if _client is None:
         if not MONGODB_URI:
             raise RuntimeError("MONGODB_URI is not configured in environment")
-        
-        # Try standard certifi connection first, with fallback to tlsAllowInvalidCertificates if Windows SSL handshake fails
+
         try:
             _client = MongoClient(
                 MONGODB_URI,
                 tls=True,
                 tlsCAFile=certifi.where(),
-                tlsAllowInvalidCertificates=True,
-                serverSelectionTimeoutMS=8000,
-                connectTimeoutMS=8000,
+                serverSelectionTimeoutMS=20000,
+                connectTimeoutMS=20000,
+                socketTimeoutMS=20000,
             )
-            # Trigger quick server selection check
-            _client.admin.command('ping')
-        except Exception as e:
-            print(f"[mongo][warning] Primary TLS check failed: {e}. Retrying with relaxed TLS options...")
-            _client = MongoClient(
-                MONGODB_URI,
-                tlsAllowInvalidCertificates=True,
-                serverSelectionTimeoutMS=8000,
-                connectTimeoutMS=8000,
-            )
-            
+            _client.admin.command("ping")
+        except Exception as exc:
+            _client = None
+            raise RuntimeError(
+                "MongoDB connection failed. Check MONGODB_URI, Atlas Network Access, "
+                f"database user credentials, and TLS settings. Original error: {exc}"
+            ) from exc
+
     return _client
 
 

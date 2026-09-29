@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import { ChartBar, PhoneCall, CalendarCheck, Robot, Waveform, MagnifyingGlass, ShieldCheck, GitBranch, Handshake, Coins } from '@phosphor-icons/react'
+import { ChartBar, PhoneCall, CalendarCheck, Robot, Waveform, MagnifyingGlass, ShieldCheck, GitBranch, Handshake, Coins, GearSix, Brain } from '@phosphor-icons/react'
 
 import { NavMain } from '@/components/nav-main'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -26,6 +26,9 @@ const navigation = [
   { title: 'Handoffs', url: '/handoffs', icon: <Handshake weight="duotone" /> },
   { title: 'Token Metrics', url: '/tokens', icon: <Coins weight="duotone" /> },
   { title: 'Prompt Lab', url: '/prompts', icon: <GitBranch weight="duotone" /> },
+  { title: 'Agent Configuration', url: '/agent-config', icon: <GearSix weight="duotone" /> },
+  { title: 'Memory Brain', url: '/memory', icon: <Brain weight="duotone" /> },
+  { title: 'Platform Lab', url: '/platform', icon: <GitBranch weight="duotone" /> },
   { title: 'Agent Console', url: '/agent', icon: <Robot weight="duotone" /> },
 ]
 

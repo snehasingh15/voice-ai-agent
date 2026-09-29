@@ -7,6 +7,7 @@ bookings, RAG retrieval, and telephony requests.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
@@ -92,6 +93,44 @@ def _doctors_collection():
 def _bookings_collection():
     return get_db().get_collection("bookings")
 
+
+def _ensure_booking_indexes() -> None:
+    try:
+        _bookings_collection().create_index("idempotency_key", unique=True, sparse=True, background=True)
+        _bookings_collection().create_index([("appointment_date", 1), ("appointment_time", 1), ("doctorName", 1), ("status", 1)], background=True)
+        _bookings_collection().create_index([("caller_id", 1), ("createdAt", -1)], background=True)
+    except Exception as exc:
+        print(f"[tools][booking-index] warning: {exc}")
+
+
+def _booking_idempotency_key(caller_id: str, patient_name: str, doctor_name: str, department: str, appointment_date: str, appointment_time: str) -> str:
+    raw = "|".join([
+        (caller_id or "anonymous").strip().lower(),
+        (patient_name or "").strip().lower(),
+        (doctor_name or "").strip().lower(),
+        (department or "").strip().lower(),
+        (appointment_date or "").strip().lower(),
+        (appointment_time or "").strip().lower(),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _clean_patient_name(patient_name: str) -> str:
+    cleaned = re.sub(r"\b(ji|sir|madam|maam|mam)\b", "", patient_name or "", flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,'-\t\n\r")
+    return cleaned
+
+
+def _patient_name_needs_confirmation(patient_name: str) -> bool:
+    cleaned = _clean_patient_name(patient_name)
+    if len(cleaned) < 2:
+        return True
+    uncertain_terms = ("unknown", "not sure", "maybe", "heard", "unclear", "anonymous")
+    if any(term in cleaned.lower() for term in uncertain_terms):
+        return True
+    if not re.search(r"[A-Za-z]", cleaned):
+        return True
+    return False
 
 def seed_default_doctors(force: bool = False) -> str:
     """Seed the doctors collection with a production demo roster."""
@@ -180,14 +219,29 @@ def create_booking(
     department: str = "",
     phone: str = "",
     notes: str = "",
+    idempotency_key: str = "",
 ) -> str:
-    """Create a real appointment booking/request in MongoDB."""
+    """Create a real appointment booking/request in MongoDB with retry-safe idempotency."""
+    patient_name = _clean_patient_name(patient_name)
+    if _patient_name_needs_confirmation(patient_name):
+        return _to_json({"ok": False, "reason": "patient_name_confirmation_required", "message": "Please confirm or spell the patient's full name before creating the booking."})
+
+    _ensure_booking_indexes()
     doctor = find_doctor(doctor_name) if doctor_name else None
+    resolved_doctor_name = (doctor or {}).get("doctorName", doctor_name)
     resolved_department = department or (doctor or {}).get("department", "")
+    effective_idempotency_key = (idempotency_key or "").strip() or _booking_idempotency_key(
+        caller_id, patient_name, resolved_doctor_name, resolved_department, appointment_date, appointment_time
+    )
+
+    replay = _bookings_collection().find_one({"idempotency_key": effective_idempotency_key})
+    if replay:
+        return _to_json({"ok": True, "idempotent_replay": True, "booking": replay})
+
     existing = _bookings_collection().find_one({
         "appointment_date": appointment_date,
         "appointment_time": appointment_time,
-        "doctorName": (doctor or {}).get("doctorName", doctor_name),
+        "doctorName": resolved_doctor_name,
         "status": {"$in": ["booked", "requested", "confirmed"]},
     })
     if existing:
@@ -201,19 +255,25 @@ def create_booking(
         "patient_name": patient_name,
         "age": age,
         "gender": gender,
-        "doctorName": (doctor or {}).get("doctorName", doctor_name),
+        "doctorName": resolved_doctor_name,
         "department": resolved_department,
         "appointment_date": appointment_date,
         "appointment_time": appointment_time,
         "status": "requested",
         "source": "voice_agent",
+        "idempotency_key": effective_idempotency_key,
         "notes": notes,
         "createdAt": now,
         "updatedAt": now,
     }
-    _bookings_collection().insert_one(booking)
-    return _to_json({"ok": True, "booking": booking})
-
+    try:
+        _bookings_collection().insert_one(booking)
+    except Exception:
+        replay = _bookings_collection().find_one({"idempotency_key": effective_idempotency_key})
+        if replay:
+            return _to_json({"ok": True, "idempotent_replay": True, "booking": replay})
+        raise
+    return _to_json({"ok": True, "idempotent_replay": False, "booking": booking})
 
 def update_booking(booking_id: str, status: str = "", appointment_date: str = "", appointment_time: str = "", notes: str = "") -> str:
     """Update booking status or reschedule details."""
@@ -436,6 +496,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "department": {"type": "string"},
                         "phone": {"type": "string"},
                         "notes": {"type": "string"},
+                        "idempotency_key": {"type": "string"},
                     },
                     "required": ["caller_id", "patient_name", "age", "gender", "appointment_date", "appointment_time"],
                 },
@@ -466,3 +527,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             },
         },
     ]
+
+
+

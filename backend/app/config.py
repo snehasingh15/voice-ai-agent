@@ -55,3 +55,6 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 TWILIO_VOICE_URL = os.getenv("TWILIO_VOICE_URL")
 TWILIO_STREAM_URL = os.getenv("TWILIO_STREAM_URL")
 TWILIO_STATUS_CALLBACK_URL = os.getenv("TWILIO_STATUS_CALLBACK_URL")
+# Comma-separated frontend origins allowed to call the API in production.
+# Example: https://your-frontend.onrender.com,https://yourdomain.com
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]

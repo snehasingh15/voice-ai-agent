@@ -2,7 +2,9 @@ import json
 import asyncio
 import urllib.error
 import urllib.request
+import urllib.parse
 
+from ..agent_config import get_configured_stt
 from ..config import DEEPGRAM_API_KEY
 
 
@@ -16,11 +18,26 @@ async def transcribe_audio(audio_bytes: bytes, mime: str = "audio/webm") -> str:
     if not DEEPGRAM_API_KEY:
         return ""  # no key; return empty transcript
 
-    url = "https://api.deepgram.com/v1/listen?punctuate=true"
+    configured = get_configured_stt()
+    params = {
+        "punctuate": "true",
+        "smart_format": "true",
+    }
+    model = (configured.get("model") or "").strip()
+    language = (configured.get("language") or "").strip()
+    keywords = (configured.get("keywords") or "").strip()
+    if model:
+        params["model"] = model
+    if language and language.lower() not in {"multi", "auto", "detect"}:
+        params["language"] = language
+    if keywords:
+        params["keywords"] = keywords
     if mime.startswith("audio/L16") or mime.startswith("audio/raw"):
-        url = "https://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&smart_format=true"
+        params.update({"encoding": "linear16", "sample_rate": "8000", "channels": "1"})
     if mime.startswith("audio/mulaw") or mime.startswith("audio/x-mulaw"):
-        url = "https://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&smart_format=true"
+        params.update({"encoding": "mulaw", "sample_rate": "8000", "channels": "1"})
+    query = urllib.parse.urlencode(params)
+    url = f"https://api.deepgram.com/v1/listen?{query}"
 
     def do_request():
         req = urllib.request.Request(url, data=audio_bytes, method="POST")

@@ -1,21 +1,22 @@
 """
-Voice AI – Production-Grade FastAPI Backend
+Voice AI â€“ Production-Grade FastAPI Backend
 ============================================
 Pipeline (end-to-end):
-  Browser mic → WebSocket (/ws/session) → Deepgram STT → LLM (Groq/Gemini) → Edge-TTS
-  → audio bytes streamed back → browser AudioContext plays response.
+  Browser mic â†’ WebSocket (/ws/session) â†’ Deepgram STT â†’ LLM (Groq/Gemini) â†’ Edge-TTS
+  â†’ audio bytes streamed back â†’ browser AudioContext plays response.
 
 Enterprise additions (v2):
-  ✓ Distributed session store (Redis ↔ MongoDB TTL fallback)
-  ✓ JWT / OAuth2 authentication with constant-time password verification
-  ✓ OpenTelemetry-compatible structured tracing (STT / LLM / TTS spans)
-  ✓ WebSocket heartbeat ping/pong + graceful error handling
+  âœ“ Distributed session store (Redis â†” MongoDB TTL fallback)
+  âœ“ JWT / OAuth2 authentication with constant-time password verification
+  âœ“ OpenTelemetry-compatible structured tracing (STT / LLM / TTS spans)
+  âœ“ WebSocket heartbeat ping/pong + graceful error handling
 """
 
 import audioop
 import base64
 import json
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -27,19 +28,50 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-# ── Internal modules ────────────────────────────────────────────────────────
+# â”€â”€ Internal modules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from .agent.prompts import CATLA_BROADBAND_PROMPT, ONE_HOSPITALS_PROMPT, SYSTEM_PROMPT, get_active_prompt
 from .agent.tools import initiate_outbound_call, seed_default_doctors
+from .agent_config import get_agent_config, save_agent_config
 from .analytics.logger import log_turn
 from .analytics.routes import router as analytics_router
 from .auth import create_access_token, get_current_admin, verify_password
-from .config import ADMIN_PASSWORD, PUBLIC_BASE_URL, TWILIO_STREAM_URL
+from .config import ADMIN_PASSWORD, PUBLIC_BASE_URL, TWILIO_STREAM_URL, ALLOWED_ORIGINS
 from .db.mongo import get_db
 from .limiter import limiter
 from .memory.session_store import append_session_message, get_session_history, set_session_history
 from .memory.store import get_caller_memory, save_caller_memory
 from .multimodal.vision import analyze_image
 from .observability import TraceSpan, get_recent_traces, log_structured
+from .platform_features import (
+    extract_conversation_fields,
+    get_agent_graph,
+    get_provider_registry,
+    get_platform_status,
+    maybe_dispatch_webhook,
+    route_with_graph,
+    run_simulation,
+    score_call_quality,
+)
+from .platform_operations import (
+    assign_ab_variant,
+    build_github_sync_payload,
+    classify_transfer_intent,
+    create_collaboration_event,
+    detect_language,
+    detect_voicemail,
+    save_voice_profile,
+    streaming_session_snapshot,
+)
+from .memory.cortex import (
+    DEFAULT_MEMORY_POLICY,
+    delete_memory_cell,
+    get_customer_memory_profile,
+    get_memory_policy,
+    ingest_memory_turn,
+    list_memory_cells,
+    retrieve_memory_context,
+    save_memory_policy,
+)
 from .pipeline.llm import generate_agent_reply, summarize_conversation
 from .pipeline.orchestrator import (
     _save_session_memory,
@@ -52,16 +84,16 @@ from .pipeline.tts import synthesize_text_to_mulaw_8k, synthesize_text_to_pcm16_
 from .rag.ingest import extract_pdf_text, ingest_text
 from .rag.retriever import retrieve_relevant_documents
 
-# ── App setup ────────────────────────────────────────────────────────────────
+# â”€â”€ App setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = FastAPI(
-    title="Voice AI – Enterprise API",
+    title="Voice AI â€“ Enterprise API",
     version="2.0.0",
     description="Production-grade multi-agent voice pipeline with JWT auth, distributed sessions, and OpenTelemetry tracing.",
 )
 app.include_router(analytics_router)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -69,6 +101,57 @@ app.add_middleware(
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+WS_MAX_CONNECTIONS_PER_IP = 5
+WS_MAX_MESSAGES_PER_MINUTE = 120
+WS_MAX_AUDIO_BYTES_PER_MINUTE = 8_000_000
+WS_MAX_TURN_AUDIO_BYTES = 15_000_000
+_ws_active_connections: dict[str, int] = defaultdict(int)
+_ws_message_windows: dict[str, deque[float]] = defaultdict(deque)
+_ws_audio_windows: dict[str, deque[tuple[float, int]]] = defaultdict(deque)
+
+
+def _websocket_client_key(websocket: WebSocket) -> str:
+    forwarded = websocket.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip() or "unknown"
+    return websocket.client.host if websocket.client else "unknown"
+
+
+def _trim_weighted_window(items, now: float, window_seconds: float) -> None:
+    while items and items[0][0] <= now - window_seconds:
+        items.popleft()
+
+
+def _allow_ws_message(key: str) -> bool:
+    now = perf_counter()
+    window = _ws_message_windows[key]
+    while window and window[0] <= now - 60:
+        window.popleft()
+    if len(window) >= WS_MAX_MESSAGES_PER_MINUTE:
+        return False
+    window.append(now)
+    return True
+
+
+def _allow_ws_audio(key: str, chunk_size: int) -> bool:
+    now = perf_counter()
+    window = _ws_audio_windows[key]
+    _trim_weighted_window(window, now, 60)
+    total = sum(size for _, size in window)
+    if total + chunk_size > WS_MAX_AUDIO_BYTES_PER_MINUTE:
+        return False
+    window.append((now, chunk_size))
+    return True
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 # Serve built frontend (optional convenience)
 _frontend_dir = (Path(__file__).resolve().parents[2] / "frontend").resolve()
@@ -90,9 +173,9 @@ async def root():
 async def healthz():
     return {"ok": True, "status": "healthy"}
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Helpers
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _rough_tokens(text: str) -> int:
     return max(1, round(len((text or "").split()) * 1.3)) if text else 0
@@ -131,9 +214,9 @@ def _add_uploaded_file_to_chat_history(caller_id: str, file_type: str, descripti
     append_session_message(session_id, "assistant", f"I analyzed the uploaded {file_type}. Description: {description}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Auth endpoints  (JWT / OAuth2)
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.post("/api/auth/login")
 @limiter.limit("10/minute")
@@ -172,19 +255,146 @@ async def check_password(request: Request):
     return {"ok": verify_password(provided)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Observability endpoint
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/observability/traces")
 async def observability_traces(limit: int = 50):
     """Recent OpenTelemetry-compatible distributed trace spans (STT / LLM / TTS)."""
     return get_recent_traces(limit=min(limit, 200))
+@app.get("/api/agent-config")
+async def read_agent_config():
+    """Current runtime configuration for LLM, STT, TTS, calling, tools, and extraction."""
+    return get_agent_config()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+@app.patch("/api/agent-config")
+async def update_agent_config(payload: dict, admin: dict = Depends(get_current_admin)):
+    """Persist runtime agent configuration in MongoDB."""
+    try:
+        return save_agent_config(payload)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/api/providers")
+async def provider_registry():
+    return get_provider_registry()
+
+@app.get("/api/platform/status")
+async def platform_status():
+    return get_platform_status()
+
+@app.post("/api/platform/language-detect")
+async def language_detect(payload: dict, admin: dict = Depends(get_current_admin)):
+    return detect_language(payload.get("text") or "")
+
+
+@app.post("/api/platform/voicemail-detect")
+async def voicemail_detect(payload: dict, admin: dict = Depends(get_current_admin)):
+    return detect_voicemail(
+        text=payload.get("text") or "",
+        audio_duration_ms=int(payload.get("audio_duration_ms") or 0),
+        silence_ms=int(payload.get("silence_ms") or 0),
+    )
+
+
+@app.post("/api/platform/ab-assign")
+async def ab_assign(payload: dict, admin: dict = Depends(get_current_admin)):
+    return assign_ab_variant(
+        experiment_id=payload.get("experiment_id") or "default-agent-test",
+        subject_id=payload.get("subject_id") or "anonymous",
+        variants=payload.get("variants") or ["A", "B"],
+    )
+
+
+@app.get("/api/platform/github-sync-payload")
+async def github_sync_payload(admin: dict = Depends(get_current_admin)):
+    return build_github_sync_payload()
+
+
+@app.post("/api/platform/collaboration-events")
+async def create_collaboration(payload: dict, admin: dict = Depends(get_current_admin)):
+    try:
+        return create_collaboration_event(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Collaboration store unavailable: {exc}")
+
+
+@app.post("/api/platform/voice-profiles")
+async def create_voice_profile(payload: dict, admin: dict = Depends(get_current_admin)):
+    try:
+        return save_voice_profile(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Voice profile store unavailable: {exc}")
+
+
+@app.post("/api/platform/transfer-intent")
+async def transfer_intent(payload: dict, admin: dict = Depends(get_current_admin)):
+    return classify_transfer_intent(payload.get("text") or "")
+
+
+@app.get("/api/agent-graph")
+async def read_agent_graph(admin: dict = Depends(get_current_admin)):
+    return get_agent_graph()
+
+
+@app.post("/api/agent-graph/route")
+async def preview_agent_route(payload: dict, admin: dict = Depends(get_current_admin)):
+    return route_with_graph(payload.get("message") or "")
+
+
+@app.post("/api/platform/simulations/run")
+async def run_platform_simulation(payload: dict, admin: dict = Depends(get_current_admin)):
+    messages = payload.get("messages") or []
+    if isinstance(messages, str):
+        messages = [line.strip() for line in messages.splitlines() if line.strip()]
+    if not messages:
+        messages = get_agent_config().get("testing", {}).get("regression_messages", [])
+    return run_simulation(messages, caller_id=payload.get("caller_id") or "simulator")
+
+
+@app.get("/api/platform/simulations")
+async def list_platform_simulations(admin: dict = Depends(get_current_admin)):
+    docs = list(get_db().get_collection("simulation_runs").find({}).sort("createdAt", -1).limit(50))
+    return [_serialize_doc(doc) for doc in docs]
+
+
+@app.post("/api/platform/qa-score")
+async def preview_qa_score(payload: dict, admin: dict = Depends(get_current_admin)):
+    return score_call_quality(payload.get("transcript") or "", payload.get("reply_text") or "", payload.get("latency_ms") or 0)
+
+
+@app.get("/api/extractions/recent")
+async def recent_extractions(admin: dict = Depends(get_current_admin)):
+    docs = list(get_db().get_collection("conversation_extractions").find({}).sort("createdAt", -1).limit(100))
+    return [_serialize_doc(doc) for doc in docs]
+
+
+@app.post("/api/webhooks/test")
+async def test_webhook(payload: dict, admin: dict = Depends(get_current_admin)):
+    return maybe_dispatch_webhook("webhook.test", {"message": payload.get("message") or "Test webhook from Voice AI"})
+
+
+@app.get("/api/telephony/calls")
+async def recent_telephony_calls(admin: dict = Depends(get_current_admin)):
+    docs = list(get_db().get_collection("telephony_calls").find({}).sort("createdAt", -1).limit(100))
+    return [_serialize_doc(doc) for doc in docs]
+
+
+@app.get("/api/telephony/events")
+async def recent_telephony_events(admin: dict = Depends(get_current_admin)):
+    docs = list(get_db().get_collection("telephony_events").find({}).sort("createdAt", -1).limit(100))
+    return [_serialize_doc(doc) for doc in docs]
+
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Chat (text) endpoint
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.post("/api/chat")
 async def chat_with_agent(payload: dict):
@@ -206,6 +416,7 @@ async def chat_with_agent(payload: dict):
             history,
             caller_summary=caller_summary,
             used_tools=used_tools,
+            caller_id=caller_id,
         )
         llm_latency_ms = (perf_counter() - llm_start) * 1000
 
@@ -227,6 +438,19 @@ async def chat_with_agent(payload: dict):
         tts_latency_ms=0,
         tool_used=", ".join(dict.fromkeys(used_tools)) if used_tools else "chat",
     )
+    memory_result = ingest_memory_turn(caller_id, session_id, message, reply or "", channel="chat")
+    extracted = extract_conversation_fields(caller_id, session_id, message, reply or "")
+    qa_score = score_call_quality(message, reply or "", llm_latency_ms)
+    maybe_dispatch_webhook("call.completed", {
+        "caller_id": caller_id,
+        "session_id": session_id,
+        "channel": "chat",
+        "transcript": message,
+        "reply_text": reply or "",
+        "tools": used_tools,
+        "extracted": extracted,
+        "qa": qa_score,
+    })
 
     if not reply.strip():
         reply = "I can help with that. Please share the doctor, department, or preferred appointment date."
@@ -250,9 +474,9 @@ async def chat_with_agent(payload: dict):
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # RAG / Knowledge Base
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.post("/api/rag/inspect")
 async def rag_inspect(payload: dict):
@@ -276,10 +500,68 @@ async def prompt_injection_demo():
         "verdict": "Demo document inserted. The system prompt instructs the agent to treat RAG content as untrusted and never reveal secrets.",
     }
 
+@app.get("/api/memory/policy")
+async def memory_policy(admin: dict = Depends(get_current_admin)):
+    return get_memory_policy()
 
-# ═══════════════════════════════════════════════════════════════════════════
+
+@app.patch("/api/memory/policy")
+async def update_memory_policy(payload: dict, admin: dict = Depends(get_current_admin)):
+    try:
+        return save_memory_policy(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Memory policy store unavailable: {exc}")
+
+
+@app.get("/api/memory/cells")
+async def memory_cells(caller_id: str = "", admin: dict = Depends(get_current_admin)):
+    try:
+        return list_memory_cells(caller_id=caller_id or None)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Memory cell store unavailable: {exc}")
+
+
+@app.get("/api/memory/context/{caller_id}")
+async def memory_context(caller_id: str, query: str = "", admin: dict = Depends(get_current_admin)):
+    try:
+        return retrieve_memory_context(caller_id, query)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Memory retrieval unavailable: {exc}")
+
+
+@app.get("/api/memory/profile/{caller_id}")
+async def memory_profile(caller_id: str, admin: dict = Depends(get_current_admin)):
+    try:
+        return get_customer_memory_profile(caller_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Memory profile unavailable: {exc}")
+
+
+@app.post("/api/memory/ingest")
+async def manual_memory_ingest(payload: dict, admin: dict = Depends(get_current_admin)):
+    try:
+        return ingest_memory_turn(
+            caller_id=payload.get("caller_id") or "anonymous",
+            session_id=payload.get("session_id") or "manual-memory",
+            transcript=payload.get("transcript") or "",
+            reply_text=payload.get("reply_text") or "",
+            channel=payload.get("channel") or "manual",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Memory ingest failed: {exc}")
+
+
+@app.delete("/api/memory/cells/{memory_id}")
+async def remove_memory_cell(memory_id: str, admin: dict = Depends(get_current_admin)):
+    try:
+        return {"ok": delete_memory_cell(memory_id)}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Memory delete failed: {exc}")
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Calendar & Bookings
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/calendar")
 async def booking_calendar():
@@ -321,9 +603,9 @@ async def update_booking_status(booking_id: str, payload: dict):
     return {"ok": True, "matched": result.matched_count, "modified": result.modified_count}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Handoffs
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/handoffs")
 async def list_handoffs():
@@ -347,9 +629,9 @@ async def create_handoff(payload: dict, admin: dict = Depends(get_current_admin)
     return doc
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Token metrics
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/token-metrics/recent")
 async def recent_token_metrics():
@@ -357,9 +639,9 @@ async def recent_token_metrics():
     return docs
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Agent Prompt Management  (guarded by JWT)
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/prompts")
 async def list_prompts():
@@ -438,9 +720,9 @@ async def delete_prompt(prompt_id: str, admin: dict = Depends(get_current_admin)
     return {"ok": result.deleted_count > 0}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Doctors & Admin seeds  (guarded by JWT)
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/doctors")
 async def doctors(department: str = ""):
@@ -470,9 +752,9 @@ async def seed_demo_data(admin: dict = Depends(get_current_admin)):
         raise HTTPException(status_code=503, detail=f"Database unavailable. Check MONGODB_URI and MongoDB Atlas network access: {exc}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # File / Image upload
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.post("/api/upload-image")
 async def upload_image(caller_id: str = Form(...), image: UploadFile = File(...)):
@@ -541,9 +823,9 @@ async def upload_file(caller_id: str = Form(...), file: UploadFile = File(...)):
     raise HTTPException(status_code=400, detail="Supported files: images, PDF, TXT, MD")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Telephony
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.post("/api/telephony/call")
 async def telephony_call(payload: dict):
@@ -560,7 +842,7 @@ async def exotel_inbound(request: Request):
     payload = {str(key): str(value) for key, value in form.items()}
     payload.update({"direction": "inbound", "createdAt": datetime.now(timezone.utc).isoformat()})
     get_db().get_collection("telephony_calls").insert_one(payload)
-    xml = """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Namaste, One Hospitals Gurgaon. Please wait while we connect you to the voice assistant.</Say></Response>"""
+    xml = """<-xml version="1.0" encoding="UTF-8"-><Response><Say>Namaste, One Hospitals Gurgaon. Please wait while we connect you to the voice assistant.</Say></Response>"""
     return Response(content=xml, media_type="application/xml")
 
 
@@ -584,10 +866,10 @@ async def twilio_voice_webhook(request: Request):
     if not stream_url and PUBLIC_BASE_URL:
         stream_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/twilio"
     if not stream_url:
-        xml = """<?xml version="1.0" encoding="UTF-8"?><Response><Say>Voice AI stream is not configured.</Say></Response>"""
+        xml = """<-xml version="1.0" encoding="UTF-8"-><Response><Say>Voice AI stream is not configured.</Say></Response>"""
         return Response(content=xml, media_type="application/xml")
 
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    xml = f"""<-xml version="1.0" encoding="UTF-8"->
 <Response>
   <Connect>
     <Stream url="{stream_url}">
@@ -598,16 +880,21 @@ async def twilio_voice_webhook(request: Request):
     return Response(content=xml, media_type="application/xml")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# WebSocket – Browser Voice Session  (/ws/session)
-# ● Bidirectional full-duplex binary audio streaming
-# ● Heartbeat ping/pong to keep proxies (Render, Nginx) alive
-# ● Distributed session via session_store (Redis ↔ MongoDB TTL)
-# ● OpenTelemetry-compatible trace span per audio turn
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# WebSocket â€“ Browser Voice Session  (/ws/session)
+# â— Bidirectional full-duplex binary audio streaming
+# â— Heartbeat ping/pong to keep proxies (Render, Nginx) alive
+# â— Distributed session via session_store (Redis â†” MongoDB TTL)
+# â— OpenTelemetry-compatible trace span per audio turn
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.websocket("/ws/session")
 async def websocket_session(websocket: WebSocket):
+    client_key = _websocket_client_key(websocket)
+    if _ws_active_connections[client_key] >= WS_MAX_CONNECTIONS_PER_IP:
+        await websocket.close(code=1008)
+        return
+    _ws_active_connections[client_key] += 1
     await websocket.accept()
     audio_buffer = bytearray()
     mime = "audio/webm"
@@ -617,17 +904,26 @@ async def websocket_session(websocket: WebSocket):
     try:
         while True:
             msg = await websocket.receive()
+            if not _allow_ws_message(client_key):
+                await websocket.send_json({"type": "error", "message": "Rate limit exceeded. Please reconnect after a minute."})
+                await websocket.close(code=1008)
+                break
 
-            # ── Clean disconnect ──────────────────────────────────────────
+            # -- Clean disconnect â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if msg.get("type") == "websocket.disconnect":
                 break
 
-            # ── Binary audio chunk ────────────────────────────────────────
+            # â”€â”€ Binary audio chunk â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if "bytes" in msg:
-                audio_buffer.extend(msg["bytes"])
+                chunk = msg["bytes"] or b""
+                if not _allow_ws_audio(client_key, len(chunk)) or len(audio_buffer) + len(chunk) > WS_MAX_TURN_AUDIO_BYTES:
+                    await websocket.send_json({"type": "error", "message": "Audio limit exceeded. Please use a shorter turn and reconnect."})
+                    await websocket.close(code=1009)
+                    break
+                audio_buffer.extend(chunk)
                 continue
 
-            # ── Text (JSON) control messages ──────────────────────────────
+            # â”€â”€ Text (JSON) control messages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if "text" in msg:
                 try:
                     data = json.loads(msg["text"]) if msg["text"] else {}
@@ -636,26 +932,46 @@ async def websocket_session(websocket: WebSocket):
 
                 msg_type = data.get("type")
 
-                # ── Heartbeat (keeps Render free-tier & Nginx proxies alive)
+                # â”€â”€ Heartbeat (keeps Render free-tier & Nginx proxies alive)
                 if msg_type == "ping":
                     await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
                     continue
 
+                if msg_type == "interrupt":
+                    audio_buffer = bytearray()
+                    streaming_session_snapshot(session_id or "anonymous", "interrupted", {"caller_id": caller_id})
+                    await websocket.send_json({"type": "interrupted", "message": "playback_cancelled"})
+                    continue
+
+                if msg_type == "language_hint":
+                    detected = detect_language(data.get("text") or "")
+                    await websocket.send_json({"type": "language_detected", **detected})
+                    continue
+
                 if msg_type == "session_start":
                     caller_id = (data.get("caller_id") or "anonymous").strip() or "anonymous"
-                    session_id = f"session-{caller_id}"
+                    session_id = f"session-{caller_id}-{uuid.uuid4().hex[:10]}"
                     log_structured("session_start", "ws", metadata={"caller_id": caller_id, "session_id": session_id})
+                    streaming_session_snapshot(session_id, "started", {"caller_id": caller_id})
                     await websocket.send_json({"type": "status", "message": "session_started"})
+                    caller_memory = get_caller_memory(caller_id)
+                    if caller_memory:
+                        await websocket.send_json({
+                            "type": "memory_recall",
+                            "text": "Welcome back. I found previous caller context, so I can continue from where we left off if you want.",
+                            "memory": caller_memory[:700],
+                        })
 
                 elif msg_type == "start":
                     if session_id is None:
                         caller_id = caller_id or "anonymous"
-                        session_id = f"session-{caller_id}"
+                        session_id = f"session-{caller_id}-{uuid.uuid4().hex[:10]}"
                     mime = data.get("mimeType", mime)
                     audio_buffer = bytearray()
                     await websocket.send_json({"type": "status", "message": "recording_started"})
 
                 elif msg_type == "stop":
+                    streaming_session_snapshot(session_id, "processing", {"audio_bytes": len(audio_buffer)})
                     await websocket.send_json({"type": "status", "message": "processing"})
                     trace_id = str(uuid.uuid4())
 
@@ -682,6 +998,7 @@ async def websocket_session(websocket: WebSocket):
                     await websocket.send_json({"type": "reply", "text": reply_text})
                     if tts_audio:
                         await websocket.send_bytes(tts_audio)
+                    streaming_session_snapshot(session_id, "completed", {"transcript": transcript[:120]})
                     await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
@@ -695,11 +1012,13 @@ async def websocket_session(websocket: WebSocket):
     finally:
         if session_id:
             _save_session_memory(session_id)
+        if client_key:
+            _ws_active_connections[client_key] = max(0, _ws_active_connections[client_key] - 1)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Exotel Voicebot WebSocket  (/ws/exotel-voicebot)
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 async def _process_exotel_utterance(websocket, stream_sid, call_sid, caller_id, history, audio_bytes):
     session_id = f"exotel|{caller_id}"
@@ -707,10 +1026,10 @@ async def _process_exotel_utterance(websocket, stream_sid, call_sid, caller_id, 
         audio_bytes,
         mime="audio/x-mulaw;rate=8000",
         session_id=session_id,
+        tts_renderer=synthesize_text_to_pcm16_8k,
     )
     if tts_audio:
-        mulaw_audio = synthesize_text_to_mulaw_8k(reply_text) if not tts_audio else tts_audio
-        payload_b64 = base64.b64encode(mulaw_audio).decode("utf-8")
+        payload_b64 = base64.b64encode(tts_audio).decode("utf-8")
         await websocket.send_json({
             "event": "media",
             "streamSid": stream_sid,
@@ -772,7 +1091,8 @@ async def exotel_voicebot(websocket: WebSocket):
                 chunk = base64.b64decode(media.get("payload", ""))
                 if not chunk:
                     continue
-                rms = audioop.rms(chunk, 2)
+                rms_sample = audioop.ulaw2lin(chunk, 2)
+                rms = audioop.rms(rms_sample, 2)
                 if rms > silence_threshold:
                     in_speech = True
                     silent_chunks = 0
@@ -811,3 +1131,7 @@ async def exotel_voicebot(websocket: WebSocket):
         log_structured("exotel_ws_disconnect", "exotel", metadata={"call_sid": call_sid})
     except Exception as exc:
         log_structured("exotel_ws_error", "exotel", level="ERROR", metadata={"error": str(exc)})
+
+
+
+

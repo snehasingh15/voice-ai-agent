@@ -1,4 +1,4 @@
-"""Distributed Session Store supporting Redis / KeyDB with automatic fallback
+﻿"""Distributed Session Store supporting Redis / KeyDB with automatic fallback
 to MongoDB Atlas persistent sessions collection with TTL (Time-To-Live).
 
 Ensures horizontal scalability across multiple FastAPI worker processes/containers
@@ -8,6 +8,7 @@ without losing active conversation context or memory.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -60,7 +61,8 @@ def get_caller_id_from_session(session_id: str | None = None) -> str | None:
     if "|" in session_id:
         return session_id.split("|", 1)[1]
     if session_id.startswith("session-"):
-        return session_id[len("session-"):]
+        caller = session_id[len("session-"):]
+        return re.sub(r"-[0-9a-f]{10}$", "", caller)
     return session_id
 
 
@@ -147,3 +149,4 @@ def clear_session(session_id: str) -> None:
         coll.delete_one({"session_id": session_id})
     except Exception:
         pass
+
