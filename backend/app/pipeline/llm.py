@@ -10,6 +10,7 @@ from ..agent.prompts import SYSTEM_PROMPT, get_active_prompt
 from ..agent.tools import (
     check_appointment_slots,
     create_booking,
+    create_service_booking,
     initiate_outbound_call,
     list_doctors,
     retrieve_hospital_knowledge,
@@ -736,6 +737,22 @@ def _call_tool_function(
             notes=arguments.get("notes") or "",
             idempotency_key=arguments.get("idempotency_key") or "",
         )
+    if tool_name == "create_service_booking":
+        return create_service_booking(
+            caller_id=arguments.get("caller_id") or "anonymous",
+            customer_name=arguments.get("customer_name") or arguments.get("patient_name") or arguments.get("name") or "",
+            service_type=arguments.get("service_type") or arguments.get("booking_type") or "callback",
+            appointment_date=arguments.get("appointment_date") or arguments.get("date") or "",
+            appointment_time=arguments.get("appointment_time") or arguments.get("time") or "",
+            agent_id=arguments.get("agent_id") or "",
+            industry=arguments.get("industry") or "",
+            organization=arguments.get("organization") or "",
+            phone=arguments.get("phone") or arguments.get("phone_number") or "",
+            email=arguments.get("email") or "",
+            notes=arguments.get("notes") or "",
+            status=arguments.get("status") or "requested",
+            idempotency_key=arguments.get("idempotency_key") or "",
+        )
     if tool_name == "update_booking":
         return update_booking(
             booking_id=arguments.get("booking_id", ""),
@@ -775,12 +792,21 @@ def _build_messages(
     tool_definitions: list[dict[str, Any]] | None = None,
     caller_summary: str | None = None,
     custom_system_prompt: str | None = None,
+    agent_context: str | None = None,
 ) -> list[dict[str, Any]]:
     active_prompt = custom_system_prompt or get_active_prompt()
-    system_prompt = active_prompt
+    if agent_context:
+        system_prompt = (
+            "You are the selected live voice agent for this test session. Follow only the selected live agent context below, "
+            "not any older active prompt/persona that may exist in the database. "
+            "Do not mention unrelated brands, old demo agents, or previous personas unless the selected context says so. "
+            f"Selected live agent context: {agent_context} "
+        )
+    else:
+        system_prompt = active_prompt
     if caller_summary:
         system_prompt = (
-            f"{active_prompt} Previous caller memory, for context only: {caller_summary} "
+            f"{system_prompt} Previous caller memory, for context only: {caller_summary} "
             "If this is the first user turn of a new session, briefly acknowledge the returning caller and offer to continue the prior unresolved task, but only after answering their latest request. "
             "Do not use remembered names, doctors, dates, times, age, gender, or booking details as current appointment fields unless the caller explicitly states or confirms them in this call. "
             "If the current caller gives a name, use exactly the current spoken name and ask confirmation before booking."
@@ -801,9 +827,9 @@ def _build_messages(
     system_prompt += (
         " Conversation policy: detect language from meaningful caller speech. "
         "If the caller already speaks in English, continue in English and do not ask Hindi or English. "
-        "If the caller already asks to book an appointment, continue the booking flow by asking for doctor, department, health concern, date, or time as needed. "
+        "If the selected context is healthcare and the caller asks to book an appointment, continue by asking for doctor, department, health concern, date, or time as needed. "
         "Do not restart the greeting after an interruption, silence, FAQ, or language switch. "
-        "Names are high-precision values: read back the patient name and ask confirmation or spelling before using it in a booking, closing, or tool call. "
+        "For non-healthcare selected agents, never use medical-role wording unless the selected agent context explicitly says healthcare. Use student, caller, customer, client, traveller, or user wording according to the selected agent context. "
         "Voice replies must be spoken naturally: do not say e.g., raw ISO dates, markdown, parentheses, examples, or internal identifiers. "
         "When a tool is needed, do not embed raw function syntax in the reply. "
         "Instead, use the model's tool-calling interface so tool calls are handled by the API."
@@ -816,6 +842,30 @@ def _build_messages(
     return messages
 
 
+
+def _agent_context_is_healthcare(agent_context: str | None) -> bool:
+    if not agent_context:
+        return True
+    lowered = agent_context.lower()
+    return "industry: healthcare" in lowered or "patient assistant" in lowered or "apollo health" in lowered
+
+def _non_healthcare_patient_leak(reply: str, agent_context: str | None) -> bool:
+    if _agent_context_is_healthcare(agent_context):
+        return False
+    return bool(re.search(r"\b(patient|doctor|hospital|health concern|department)\b", reply or "", re.I))
+
+
+def _selected_agent_repair_reply(user_text: str, agent_context: str | None) -> str:
+    lowered = (agent_context or "").lower()
+    if "industry: education" in lowered:
+        return "Hi Priya. This is the FORE School counsellor agent. I can explain the programme, answer admissions questions, and book a counsellor discussion. What date and time would you prefer for the counselling booking?"
+    if "industry: finance" in lowered:
+        return "I can help with your finance or consultancy request and book a consultation. What topic should the consultation cover, and what date and time work for you?"
+    if "industry: travel" in lowered:
+        return "I can help plan your travel enquiry and book a travel consultation. Which destination and date should I note?"
+    if "industry: telecom" in lowered:
+        return "I can help with your support request and book a callback if needed. What issue should I note?"
+    return "I can help with that agent's service booking. What date and time should I note?"
 def generate_agent_reply(
     user_text: str,
     history: list[dict[str, str]],
@@ -825,9 +875,11 @@ def generate_agent_reply(
     caller_summary: str | None = None,
     used_tools: list[str] | None = None,
     caller_id: str = "anonymous",
+    agent_context: str | None = None,
 ) -> str:
     """Call Groq with model fallback and tool calling support; fallback to Gemini if needed."""
-    if _is_booking_confirmation_turn(user_text, history):
+    healthcare_booking_shortcuts = _agent_context_is_healthcare(agent_context)
+    if healthcare_booking_shortcuts and _is_booking_confirmation_turn(user_text, history):
         state = _extract_booking_state(user_text, history)
         missing = _missing_booking_fields(state, user_text, history)
         if missing:
@@ -841,21 +893,21 @@ def generate_agent_reply(
             history=history,
         )
         return _booking_created_reply(tool_output)
-    deterministic_booking_reply = _booking_ready_for_confirmation(user_text, history)
+    deterministic_booking_reply = _booking_ready_for_confirmation(user_text, history) if healthcare_booking_shortcuts else ""
     if deterministic_booking_reply:
         return deterministic_booking_reply
 
     if client is None:
         api_key = GROQ_API_KEY
         if not api_key:
-            messages = _build_messages(user_text, history, tool_definitions, caller_summary=caller_summary)
+            messages = _build_messages(user_text, history, tool_definitions, caller_summary=caller_summary, agent_context=agent_context)
             return _call_gemini_fallback(messages)
         client = Groq(api_key=api_key)
 
     if tool_definitions is None:
         tool_definitions = get_tool_definitions()
 
-    messages = _build_messages(user_text, history, tool_definitions, caller_summary=caller_summary)
+    messages = _build_messages(user_text, history, tool_definitions, caller_summary=caller_summary, agent_context=agent_context)
 
     try:
         response = _call_groq_with_fallback(client, messages, tools=tool_definitions, temperature=0.2)
@@ -865,6 +917,8 @@ def generate_agent_reply(
 
     message = response.choices[0].message
     reply_text = getattr(message, "content", "") or ""
+    if _non_healthcare_patient_leak(reply_text, agent_context):
+        return _selected_agent_repair_reply(user_text, agent_context)
     tool_calls = getattr(message, "tool_calls", None) or []
 
     if not tool_calls and "<function=" in reply_text:
@@ -891,8 +945,13 @@ def generate_agent_reply(
                 follow_up_message = follow_up_response.choices[0].message
                 final_reply = getattr(follow_up_message, "content", "") or ""
                 if "<function=" in final_reply:
-                    return _enforce_conversation_policy(final_reply.replace("<function=", "[tool-call]"), user_text, history)
+                    final_reply = _enforce_conversation_policy(final_reply.replace("<function=", "[tool-call]"), user_text, history)
+                    if _non_healthcare_patient_leak(final_reply, agent_context):
+                        return _selected_agent_repair_reply(user_text, agent_context)
+                    return final_reply
                 final_reply = _enforce_conversation_policy(final_reply, user_text, history)
+                if _non_healthcare_patient_leak(final_reply, agent_context):
+                    return _selected_agent_repair_reply(user_text, agent_context)
                 return final_reply or _fallback_reply_from_tools([{"role": "tool", "content": tool_output}], user_text, history)
             except Exception:
                 return "The requested information has been updated."
@@ -924,14 +983,21 @@ def generate_agent_reply(
             follow_up_message = follow_up_response.choices[0].message
             final_reply = getattr(follow_up_message, "content", "") or ""
             if "<function=" in final_reply:
-                return _enforce_conversation_policy(final_reply.replace("<function=", "[tool-call]"), user_text, history)
+                final_reply = _enforce_conversation_policy(final_reply.replace("<function=", "[tool-call]"), user_text, history)
+                if _non_healthcare_patient_leak(final_reply, agent_context):
+                    return _selected_agent_repair_reply(user_text, agent_context)
+                return final_reply
             final_reply = _enforce_conversation_policy(final_reply, user_text, history)
+            if _non_healthcare_patient_leak(final_reply, agent_context):
+                return _selected_agent_repair_reply(user_text, agent_context)
             return final_reply or _fallback_reply_from_tools(tool_results, user_text, history)
         except Exception:
             return "I have processed your request."
 
     reply_text = _enforce_conversation_policy(reply_text, user_text, history)
-    return reply_text or (_booking_next_question(user_text, history) if _has_appointment_intent(user_text) else "I can help with that. Could you please repeat the last detail-")
+    if _non_healthcare_patient_leak(reply_text, agent_context):
+        return _selected_agent_repair_reply(user_text, agent_context)
+    return reply_text or (_booking_next_question(user_text, history) if healthcare_booking_shortcuts and _has_appointment_intent(user_text) else "I can help with that. Could you please repeat the last detail-")
 
 
 def summarize_conversation(history: list[dict[str, str]]) -> str:

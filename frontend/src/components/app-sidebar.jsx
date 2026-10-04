@@ -1,5 +1,17 @@
 import { Link, useLocation } from 'react-router-dom'
-import { ChartBar, PhoneCall, CalendarCheck, Robot, Waveform, MagnifyingGlass, ShieldCheck, GitBranch, Handshake, Coins, GearSix, Brain } from '@phosphor-icons/react'
+import {
+  ChartBar,
+  PhoneCall,
+  Robot,
+  Waveform,
+  MagnifyingGlass,
+  ShieldCheck,
+  Coins,
+  Brain,
+  Microphone,
+  GearSix,
+  CalendarBlank,
+} from '@phosphor-icons/react'
 
 import { NavMain } from '@/components/nav-main'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -18,18 +30,15 @@ import {
 
 const navigation = [
   { title: 'Overview', url: '/overview', icon: <ChartBar weight="duotone" /> },
+  { title: 'Agents', url: '/agents', icon: <Robot weight="duotone" /> },
+  { title: 'Agent Config', url: '/agent-config', icon: <GearSix weight="duotone" /> },
+  { title: 'Memory', url: '/memory', icon: <Brain weight="duotone" /> },
   { title: 'Interactions', url: '/interactions', icon: <PhoneCall weight="duotone" /> },
-  { title: 'Bookings', url: '/bookings', icon: <CalendarCheck weight="duotone" /> },
-  { title: 'Calendar', url: '/calendar', icon: <CalendarCheck weight="duotone" /> },
+  { title: 'Bookings', url: '/bookings', icon: <CalendarBlank weight="duotone" /> },
   { title: 'RAG Inspector', url: '/rag', icon: <MagnifyingGlass weight="duotone" /> },
-  { title: 'Safety', url: '/safety', icon: <ShieldCheck weight="duotone" /> },
-  { title: 'Handoffs', url: '/handoffs', icon: <Handshake weight="duotone" /> },
+  { title: 'Safety & Guardrails', url: '/safety', icon: <ShieldCheck weight="duotone" /> },
   { title: 'Token Metrics', url: '/tokens', icon: <Coins weight="duotone" /> },
-  { title: 'Prompt Lab', url: '/prompts', icon: <GitBranch weight="duotone" /> },
-  { title: 'Agent Configuration', url: '/agent-config', icon: <GearSix weight="duotone" /> },
-  { title: 'Memory Brain', url: '/memory', icon: <Brain weight="duotone" /> },
-  { title: 'Platform Lab', url: '/platform', icon: <GitBranch weight="duotone" /> },
-  { title: 'Agent Console', url: '/agent', icon: <Robot weight="duotone" /> },
+  { title: 'Agent Console', url: '/agent', icon: <Microphone weight="duotone" /> },
 ]
 
 export function AppSidebar({ ...props }) {

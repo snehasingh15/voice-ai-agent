@@ -115,6 +115,23 @@ def _booking_idempotency_key(caller_id: str, patient_name: str, doctor_name: str
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+
+def _name_from_caller_id(caller_id: str) -> str:
+    raw = (caller_id or "").strip()
+    raw = re.sub(r"^(session-|chat-)", "", raw, flags=re.I)
+    raw = raw.split("-", 1)[0]
+    raw = re.sub(r"[_+.]+", " ", raw)
+    raw = re.sub(r"\d+", "", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw or raw.lower() in {"anonymous", "unknown", "caller", "test"}:
+        return ""
+    return " ".join(part[:1].upper() + part[1:].lower() for part in raw.split() if part)
+
+
+def _is_placeholder_name(value: str) -> bool:
+    cleaned = (value or "").strip().lower()
+    return not cleaned or cleaned in {"[name]", "{name}", "name", "unknown", "anonymous", "caller", "customer", "user"}
+
 def _clean_patient_name(patient_name: str) -> str:
     cleaned = re.sub(r"\b(ji|sir|madam|maam|mam)\b", "", patient_name or "", flags=re.I)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,'-\t\n\r")
@@ -274,6 +291,72 @@ def create_booking(
             return _to_json({"ok": True, "idempotent_replay": True, "booking": replay})
         raise
     return _to_json({"ok": True, "idempotent_replay": False, "booking": booking})
+
+def create_service_booking(
+    caller_id: str,
+    customer_name: str,
+    service_type: str,
+    appointment_date: str,
+    appointment_time: str,
+    agent_id: str = "",
+    industry: str = "",
+    organization: str = "",
+    phone: str = "",
+    email: str = "",
+    notes: str = "",
+    status: str = "requested",
+    idempotency_key: str = "",
+) -> str:
+    """Create a generic service booking/callback across education, finance, travel, healthcare, and telecom agents."""
+    customer_name = _clean_patient_name(customer_name)
+    if _patient_name_needs_confirmation(customer_name):
+        return _to_json({"ok": False, "reason": "customer_name_confirmation_required", "message": "Please confirm or spell the customer's full name before creating the booking."})
+
+    effective_key = (idempotency_key or "").strip() or _booking_idempotency_key(
+        caller_id,
+        customer_name,
+        agent_id or organization,
+        service_type or industry,
+        appointment_date,
+        appointment_time,
+    )
+    _ensure_booking_indexes()
+    replay = _bookings_collection().find_one({"idempotency_key": effective_key})
+    if replay:
+        return _to_json({"ok": True, "idempotent_replay": True, "booking": replay})
+
+    now = datetime.now(timezone.utc)
+    booking = {
+        "_id": str(uuid.uuid4()),
+        "caller_id": caller_id or "anonymous",
+        "phone": phone,
+        "email": email,
+        "patient_name": customer_name,
+        "customer_name": customer_name,
+        "service_type": service_type,
+        "industry": industry,
+        "organization": organization,
+        "agent_id": agent_id,
+        "department": service_type or industry,
+        "doctorName": organization or agent_id,
+        "appointment_date": appointment_date,
+        "appointment_time": appointment_time,
+        "status": status or "requested",
+        "source": "service_booking_tool",
+        "idempotency_key": effective_key,
+        "notes": notes,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    try:
+        _bookings_collection().insert_one(booking)
+    except Exception:
+        replay = _bookings_collection().find_one({"idempotency_key": effective_key})
+        if replay:
+            return _to_json({"ok": True, "idempotent_replay": True, "booking": replay})
+        raise
+    return _to_json({"ok": True, "idempotent_replay": False, "booking": booking})
+
 
 def update_booking(booking_id: str, status: str = "", appointment_date: str = "", appointment_time: str = "", notes: str = "") -> str:
     """Update booking status or reschedule details."""
@@ -499,6 +582,32 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "idempotency_key": {"type": "string"},
                     },
                     "required": ["caller_id", "patient_name", "age", "gender", "appointment_date", "appointment_time"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_service_booking",
+                "description": "Create a generic service booking, callback, counsellor discussion, consultation, travel follow-up, or support callback after required details are confirmed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caller_id": {"type": "string"},
+                        "customer_name": {"type": "string"},
+                        "service_type": {"type": "string"},
+                        "appointment_date": {"type": "string"},
+                        "appointment_time": {"type": "string", "description": "24-hour HH:MM local time"},
+                        "agent_id": {"type": "string"},
+                        "industry": {"type": "string"},
+                        "organization": {"type": "string"},
+                        "phone": {"type": "string"},
+                        "email": {"type": "string"},
+                        "notes": {"type": "string"},
+                        "status": {"type": "string"},
+                        "idempotency_key": {"type": "string"}
+                    },
+                    "required": ["caller_id", "customer_name", "service_type", "appointment_date", "appointment_time"]
                 },
             },
         },

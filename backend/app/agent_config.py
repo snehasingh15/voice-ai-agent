@@ -11,9 +11,12 @@ from .db.mongo import get_db
 CONFIG_ID = "default"
 
 DEFAULT_AGENT_CONFIG: dict[str, Any] = {
+    "agent_name": "Voice Agent",
+    "agent_welcome_message": "Hello, how may I help you today?",
+    "agent_guardrails": "Never provide unverified medical diagnoses. Redact all financial PII and OTPs. Maintain empathetic, professional tone.",
     "llm": {
-        "provider": "groq",
-        "model": (GROQ_MODELS.split(",")[0].strip() if GROQ_MODELS else "openai/gpt-oss-20b"),
+        "provider": "gemini",
+        "model": "gemini-3.5-flash-light",
         "temperature": 0.2,
         "max_tokens": 450,
         "reasoning_effort": "low",
@@ -27,14 +30,14 @@ DEFAULT_AGENT_CONFIG: dict[str, Any] = {
         "endpointing_ms": 800,
     },
     "tts": {
-        "provider": "edge",
-        "model": "edge-tts",
-        "voice": "en-US-AriaNeural",
+        "provider": "cartesia",
+        "model": "sonic-3.6",
+        "voice": "Sonic-English-Natural",
         "speed": 1.0,
         "stability": 0.5,
     },
     "calling": {
-        "telephony_provider": TELEPHONY_PROVIDER or "exotel",
+        "telephony_provider": "provider_kyc_required",
         "ambient_noise": "none",
         "noise_cancellation_percent": 100,
         "voicemail_detection_seconds": 2.5,
@@ -108,28 +111,38 @@ def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
-def get_agent_config() -> dict[str, Any]:
+def _config_id(agent_id: str | None = None) -> str:
+    clean = (agent_id or "").strip()
+    return clean or CONFIG_ID
+
+
+def get_agent_config(agent_id: str | None = None) -> dict[str, Any]:
     config = deepcopy(DEFAULT_AGENT_CONFIG)
+    doc_id = _config_id(agent_id)
+    config["agent_id"] = doc_id
     try:
-        doc = get_db().get_collection("agent_configurations").find_one({"_id": CONFIG_ID}) or {}
+        doc = get_db().get_collection("agent_configurations").find_one({"_id": doc_id}) or {}
         config = _deep_merge(config, {k: v for k, v in doc.items() if k not in {"_id", "updatedAt"}})
+        config["agent_id"] = doc_id
     except Exception as exc:
         print(f"[agent-config][warning] using defaults: {exc}")
     return config
 
 
-def save_agent_config(updates: dict[str, Any]) -> dict[str, Any]:
-    config = _deep_merge(get_agent_config(), updates or {})
+def save_agent_config(updates: dict[str, Any], agent_id: str | None = None) -> dict[str, Any]:
+    doc_id = _config_id(agent_id or (updates or {}).get("agent_id"))
+    config = _deep_merge(get_agent_config(doc_id), updates or {})
+    config["agent_id"] = doc_id
     config["updatedAt"] = datetime.now(timezone.utc)
     try:
         get_db().get_collection("agent_configurations").update_one(
-            {"_id": CONFIG_ID},
+            {"_id": doc_id},
             {"$set": config},
             upsert=True,
         )
     except Exception as exc:
         raise RuntimeError(f"Could not save agent configuration: {exc}") from exc
-    return get_agent_config()
+    return get_agent_config(doc_id)
 
 
 def get_configured_llm() -> dict[str, Any]:

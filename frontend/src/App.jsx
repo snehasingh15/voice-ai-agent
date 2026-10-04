@@ -35,6 +35,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { LoginView } from '@/components/LoginView'
+import { AgentsView, AGENT_CATALOG, INDUSTRIES } from '@/components/AgentsView'
+import { MemoryCortexView } from '@/components/MemoryCortexView'
 
 const defaultApiBaseUrl =
   typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname)
@@ -311,18 +314,35 @@ function Interactions() {
   )
 }
 
+function displayBookingName(row) {
+  const raw = String(row?.customer_name || row?.patient_name || '').trim()
+  if (raw && !['[name]', '{name}', 'name', 'unknown', 'anonymous', 'caller', 'customer', 'user'].includes(raw.toLowerCase())) return raw
+  const caller = String(row?.caller_id || '').split('-', 1)[0].replace(/^(session-|chat-)/i, '').replace(/[_+.]+/g, ' ').replace(/\d+/g, '').trim()
+  if (!caller || ['anonymous', 'unknown', 'caller', 'test'].includes(caller.toLowerCase())) return row?.caller_id || 'anonymous'
+  return caller.split(/\s+/).map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()).join(' ')
+}
 function Bookings() {
+  const pageSize = 10
+  const [page, setPage] = useState(1)
   const { data = [], isLoading, error } = useQuery({
     queryKey: ['bookings'],
     queryFn: () => getJson('/api/bookings'),
   })
+  const totalPages = Math.max(1, Math.ceil(data.length / pageSize))
+  const safePage = Math.min(page, totalPages)
+  const startIndex = (safePage - 1) * pageSize
+  const paginatedRows = data.slice(startIndex, startIndex + pageSize)
+  const firstRecord = data.length ? startIndex + 1 : 0
+  const lastRecord = Math.min(startIndex + pageSize, data.length)
+
+  useEffect(() => { setPage(1) }, [data.length])
 
   return (
     <AppShell title="Bookings">
       <PageIntro
-        title="Tool calls connect caller intent to the agent response"
-        lede="This view keeps bookings and tool activity readable without hiding transcript or reply context."
-        meta={isLoading ? 'Loading' : error ? 'API unavailable' : `${data.length} rows`}
+        title="Agent Bookings & Scheduled Actions"
+        lede="View and manage all bookings created by agents via tool calls — appointments, reservations, and follow-up actions."
+        meta={isLoading ? 'Loading' : error ? 'API unavailable' : `${data.length} bookings`}
       />
       <Card>
         <CardContent className="px-0">
@@ -341,7 +361,7 @@ function Bookings() {
                 paginatedRows.map((row) => (
                   <TableRow key={row._id || `${row.createdAt}-${row.patient_name}`}>
                     <TableCell className="text-muted-foreground">{formatTime(row.createdAt)}</TableCell>
-                    <TableCell>{row.patient_name || row.caller_id || 'anonymous'}</TableCell>
+                    <TableCell>{displayBookingName(row)}</TableCell>
                     <TableCell>{row.doctorName || row.department || 'â€”'}</TableCell>
                     <TableCell>{row.appointment_date || 'â€”'} {row.appointment_time || ''}</TableCell>
                     <TableCell>
@@ -351,13 +371,25 @@ function Bookings() {
                 ))
               ) : (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-muted-foreground text-center">
-                    No records returned.
+                  <TableCell colSpan={5} className="text-muted-foreground text-center py-8">
+                    {isLoading ? 'Loading bookings…' : 'No bookings yet. Agent tool calls will populate this table.'}
                   </TableCell>
                 </TableRow>
               )}
             </TableBody>
           </Table>
+          <div className="flex flex-col gap-3 border-t px-4 py-3 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+            <span>{data.length ? `Showing ${firstRecord}–${lastRecord} of ${data.length}` : 'No records'}</span>
+            <div className="flex items-center gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={() => setPage((v) => Math.max(1, v - 1))} disabled={safePage <= 1}>
+                Previous
+              </Button>
+              <span className="min-w-20 text-center">Page {safePage} of {totalPages}</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => setPage((v) => Math.min(totalPages, v + 1))} disabled={safePage >= totalPages}>
+                Next
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </AppShell>
@@ -987,7 +1019,7 @@ function PromptLab() {
                   </div>
                   <div>
                     <CardTitle className="text-lg font-bold">
-                      {agent.name || (agent.version.includes('catla') ? 'Catla Broadband Help Desk' : 'One Hospitals Gurgaon Booking Agent')}
+                      {agent.name || 'Voice Agent'}
                     </CardTitle>
                     <CardDescription className="flex items-center gap-2 mt-1">
                       <Badge variant="secondary" className="text-xs">
@@ -1075,7 +1107,7 @@ function PromptLab() {
               {data.map((row) => (
                 <TableRow key={row._id || row.version}>
                   <TableCell className="font-medium">
-                    {row.name || (row.version.includes('catla') ? 'Catla Broadband Support' : 'One Hospitals Booking')}
+                    {row.name || 'Voice Agent'}
                   </TableCell>
                   <TableCell>
                     <Badge variant="outline" className="text-xs">
@@ -1300,7 +1332,7 @@ function NativeSelect({ value, onChange, children }) {
 const providerModelOptions = {
   llm: {
     groq: ['openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'groq/compound-mini'],
-    gemini: ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3.7-flash'],
+    gemini: ['gemini-3.5-flash-light', 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3.7-flash'],
     openai: ['gpt-4.1-mini', 'gpt-4o-mini', 'gpt-4o'],
     azure: ['azure:gpt-4o-mini', 'azure:gpt-4o'],
   },
@@ -1317,7 +1349,7 @@ const providerModelOptions = {
     edge: ['edge-tts'],
     elevenlabs: ['eleven_turbo_v2_5', 'eleven_multilingual_v2', 'eleven_flash_v2_5'],
     openai: ['gpt-4o-mini-tts', 'tts-1', 'tts-1-hd'],
-    cartesia: ['sonic-2', 'sonic-turbo'],
+    cartesia: ['sonic-3.6', 'sonic-2', 'sonic-turbo'],
     rime: ['mistv2'],
     polly: ['neural', 'standard'],
   },
@@ -1329,14 +1361,15 @@ function modelOptionsFor(kind, provider, currentModel) {
 }
 
 function defaultModelFor(kind, provider, currentModel = '') {
-  return modelOptionsFor(kind, provider, currentModel)[0] || currentModel || ''
+  const options = providerModelOptions[kind]?.[provider] || []
+  return options[0] || currentModel || ''
 }
 const fallbackAgentConfig = {
-  llm: { provider: 'groq', model: 'openai/gpt-oss-20b', temperature: 0.2, max_tokens: 450, reasoning_effort: 'low' },
+  llm: { provider: 'gemini', model: 'gemini-3.5-flash-light', temperature: 0.2, max_tokens: 450, reasoning_effort: 'low' },
   stt: { provider: 'deepgram', model: 'nova-3', language: 'multi', keywords: '', context: '', endpointing_ms: 800 },
-  tts: { provider: 'edge', model: 'edge-tts', voice: 'en-US-AriaNeural', speed: 1, stability: 0.5 },
+  tts: { provider: 'cartesia', model: 'sonic-3.6', voice: 'Sonic-English-Natural', speed: 1, stability: 0.5 },
   calling: {
-    telephony_provider: 'exotel', ambient_noise: 'none', noise_cancellation_percent: 100,
+    telephony_provider: 'provider_kyc_required', ambient_noise: 'none', noise_cancellation_percent: 100,
     voicemail_detection_seconds: 2.5, dtmf_enabled: false, auto_reschedule: false,
     inbound_enabled: true, total_call_timeout_seconds: 2400, user_online_detection: true,
     user_online_message: 'Hello, are you still on the line-', final_call_message: 'Thank you for your time. Goodbye.',
@@ -1360,31 +1393,48 @@ const fallbackAgentConfig = {
 }
 function AgentConfiguration() {
   const queryClient = useQueryClient()
+  const initialAgentId = new URLSearchParams(window.location.search).get('agent') || AGENT_CATALOG[0]?.id || ''
+  const initialCatalogAgent = AGENT_CATALOG.find((agent) => agent.id === initialAgentId) || AGENT_CATALOG[0]
+  const [selectedIndustry, setSelectedIndustry] = useState(initialCatalogAgent?.industry || INDUSTRIES[0]?.id || 'education')
+  const [selectedAgentId, setSelectedAgentId] = useState(initialCatalogAgent?.id || '')
+  const configAgents = useMemo(() => AGENT_CATALOG.filter((agent) => agent.industry === selectedIndustry), [selectedIndustry])
+  const selectedConfigAgent = AGENT_CATALOG.find((agent) => agent.id === selectedAgentId) || configAgents[0] || AGENT_CATALOG[0]
+  const selectedConfigIndustry = INDUSTRIES.find((item) => item.id === selectedIndustry) || INDUSTRIES[0]
   const [activeTab, setActiveTab] = useState('intelligence')
   const [draft, setDraft] = useState(null)
 
+  useEffect(() => {
+    if (!configAgents.some((agent) => agent.id === selectedAgentId)) {
+      setSelectedAgentId(configAgents[0]?.id || '')
+    }
+  }, [configAgents, selectedAgentId])
+
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['agent-config'],
-    queryFn: () => getJson('/api/agent-config'),
+    queryKey: ['agent-config', selectedConfigAgent?.id],
+    queryFn: () => getJson(`/api/agent-config?agent_id=${encodeURIComponent(selectedConfigAgent?.id || '')}`),
     retry: false,
   })
+
+  useEffect(() => {
+    setDraft(null)
+  }, [selectedConfigAgent?.id])
 
   useEffect(() => {
     if (data) setDraft(data)
   }, [data])
 
   useEffect(() => {
-    if (error && !draft) setDraft(fallbackAgentConfig)
-  }, [error, draft])
+    if (error && !draft) setDraft({ ...fallbackAgentConfig, agent_id: selectedConfigAgent?.id, agent_name: selectedConfigAgent?.name, agent_welcome_message: selectedConfigAgent?.welcome })
+  }, [error, draft, selectedConfigAgent])
 
   const saveConfig = useMutation({
     mutationFn: async () => {
-      const res = await adminFetch('/api/agent-config', {
+      const res = await adminFetch(`/api/agent-config?agent_id=${encodeURIComponent(selectedConfigAgent?.id || '')}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify((() => {
           const { graph_raw_error: _graphRawError, ...safeDraft } = draft || fallbackAgentConfig
-          return safeDraft
+          return { ...safeDraft, agent_id: selectedConfigAgent?.id, agent_name: selectedConfigAgent?.name, agent_welcome_message: selectedConfigAgent?.welcome }
         })()),
       })
       if (!res.ok) throw new Error(await res.text())
@@ -1392,15 +1442,16 @@ function AgentConfiguration() {
     },
     onSuccess: (saved) => {
       setDraft(saved)
-      queryClient.invalidateQueries({ queryKey: ['agent-config'] })
+      queryClient.invalidateQueries({ queryKey: ['agent-config', selectedConfigAgent?.id] })
     },
   })
 
-  const setConfig = (section, key, value) => setDraft((current) => updateNestedConfig(current, section, key, value))
+  const setConfig = (section, key, value) => setDraft((current) => updateNestedConfig(current || fallbackAgentConfig, section, key, value))
   const setProviderConfig = (section, kind, provider) => setDraft((current) => {
-    const existing = current?.[section] || {}
+    const base = current || fallbackAgentConfig
+    const existing = base?.[section] || {}
     return {
-      ...current,
+      ...base,
       [section]: {
         ...existing,
         provider,
@@ -1433,7 +1484,21 @@ function AgentConfiguration() {
               {saveConfig.isPending ? 'Saving' : error ? 'Save to backend' : 'Save'}
             </Button>
           </div>
-          <div className="grid gap-1 rounded-md bg-muted p-1 md:grid-cols-7">
+          <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[220px_1fr]">
+            <ConfigField label="Industry Type">
+              <NativeSelect value={selectedIndustry} onChange={(value) => setSelectedIndustry(value)}>
+                {INDUSTRIES.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+              </NativeSelect>
+            </ConfigField>
+            <ConfigField label="Configure Agent">
+              <NativeSelect value={selectedConfigAgent?.id || ''} onChange={(value) => setSelectedAgentId(value)}>
+                {configAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+              </NativeSelect>
+            </ConfigField>
+            <div className="rounded-md bg-background/70 p-3 text-xs text-muted-foreground md:col-span-2">
+              <strong className="text-foreground">{selectedConfigAgent?.name}</strong> / {selectedConfigIndustry?.label} / {selectedConfigAgent?.organization}. Changes below save against this agent id only.
+            </div>
+          </div>`r`n          <div className="grid gap-1 rounded-md bg-muted p-1 md:grid-cols-7">
             {configTabs.map(([id, label, Icon]) => (
               <button
                 key={id}
@@ -1465,7 +1530,7 @@ function AgentConfiguration() {
               <ConfigField label="Provider">
                 <NativeSelect value={cfg.llm?.provider} onChange={(value) => setProviderConfig('llm', 'llm', value)}>
                   <option value="groq">Groq</option>
-                  <option value="gemini">Gemini fallback</option>
+                  <option value="gemini">Gemini</option>
                   <option value="openai">OpenAI</option>
                   <option value="azure">Azure OpenAI</option>
                 </NativeSelect>
@@ -1478,8 +1543,8 @@ function AgentConfiguration() {
               <ConfigField label={`Max output tokens: ${cfg.llm?.max_tokens || 450}`}>
                 <input type="range" min="100" max="2000" step="50" value={cfg.llm?.max_tokens || 450} onChange={(e) => setNumberConfig('llm', 'max_tokens', e.target.value)} />
               </ConfigField>
-              <ConfigField label={`Temperature: ${cfg.llm?.temperature == 0.2}`}>
-                <input type="range" min="0" max="1" step="0.05" value={cfg.llm?.temperature == 0.2} onChange={(e) => setNumberConfig('llm', 'temperature', e.target.value)} />
+              <ConfigField label={`Temperature: ${cfg.llm?.temperature ?? 0.2}`}>
+                <input type="range" min="0" max="1" step="0.05" value={cfg.llm?.temperature ?? 0.2} onChange={(e) => setNumberConfig('llm', 'temperature', e.target.value)} />
               </ConfigField>
             </div>
           ) : null}
@@ -1544,9 +1609,10 @@ function AgentConfiguration() {
               <div className="grid gap-4 md:grid-cols-2">
                 <ConfigField label="Telephony provider">
                   <NativeSelect value={cfg.calling?.telephony_provider} onChange={(value) => setConfig('calling', 'telephony_provider', value)}>
+                    <option value="provider_kyc_required">Provider KYC required</option>
                     <option value="exotel">Exotel</option>
                     <option value="twilio">Twilio</option>
-                    <option value="plivo">Plivo</option>
+                    <option value="plivo">Voice provider setup required</option>
                     <option value="sip_trunk">SIP trunk</option>
                   </NativeSelect>
                 </ConfigField>
@@ -1595,8 +1661,8 @@ function AgentConfiguration() {
               <ConfigField label={`Response speed: ${cfg.tts?.speed || 1}x`}>
                 <input type="range" min="0.7" max="1.3" step="0.05" value={cfg.tts?.speed || 1} onChange={(e) => setNumberConfig('tts', 'speed', e.target.value)} />
               </ConfigField>
-              <ConfigField label={`Voice stability: ${cfg.tts?.stability == 0.5}`}>
-                <input type="range" min="0" max="1" step="0.05" value={cfg.tts?.stability == 0.5} onChange={(e) => setNumberConfig('tts', 'stability', e.target.value)} />
+              <ConfigField label={`Voice stability: ${cfg.tts?.stability ?? 0.5}`}>
+                <input type="range" min="0" max="1" step="0.05" value={cfg.tts?.stability ?? 0.5} onChange={(e) => setNumberConfig('tts', 'stability', e.target.value)} />
               </ConfigField>
               <ConfigField label="User online message">
                 <textarea className="min-h-20 rounded-md border border-input bg-background p-3 text-sm outline-hidden focus:ring-2 focus:ring-ring/40" value={cfg.calling?.user_online_message || ''} onChange={(e) => setConfig('calling', 'user_online_message', e.target.value)} />
@@ -2102,24 +2168,22 @@ function toAgentState(status) {
 }
 
 function AgentTester() {
-  const queryClient = useQueryClient()
-  const { data: prompts = [] } = useQuery({
-    queryKey: ['prompts'],
-    queryFn: () => getJson('/api/prompts'),
-  })
+  const initialAgentId = new URLSearchParams(window.location.search).get('agent') || AGENT_CATALOG[0]?.id || ''
+  const initialCatalogAgent = AGENT_CATALOG.find((agent) => agent.id === initialAgentId) || AGENT_CATALOG[0]
+  const [selectedIndustry, setSelectedIndustry] = useState(initialCatalogAgent?.industry || INDUSTRIES[0]?.id || 'education')
+  const [selectedAgentId, setSelectedAgentId] = useState(initialCatalogAgent?.id || '')
+  const consoleAgents = useMemo(
+    () => AGENT_CATALOG.filter((agent) => agent.industry === selectedIndustry),
+    [selectedIndustry],
+  )
+  const selectedConsoleAgent = AGENT_CATALOG.find((agent) => agent.id === selectedAgentId) || consoleAgents[0] || AGENT_CATALOG[0]
+  const selectedIndustryMeta = INDUSTRIES.find((item) => item.id === selectedIndustry) || INDUSTRIES[0]
 
-  const activeAgent = prompts.find((p) => p.is_active) || prompts[0]
-
-  const switchAgentMutation = useMutation({
-    mutationFn: async (id) => {
-      const res = await adminFetch(`/api/prompts/activate/${id}`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['prompts'] })
-    },
-  })
+  useEffect(() => {
+    if (!consoleAgents.some((agent) => agent.id === selectedAgentId)) {
+      setSelectedAgentId(consoleAgents[0]?.id || '')
+    }
+  }, [consoleAgents, selectedAgentId])
 
   const [callerId, setCallerId] = useState(() => window.localStorage?.getItem('voice_ai_caller_id') || '')
   const callerIdRef = useRef(callerId)
@@ -2129,7 +2193,6 @@ function AgentTester() {
   const [reply, setReply] = useState('')
   const [fileDescription, setFileDescription] = useState('none')
   const [file, setFile] = useState(null)
-  const [phoneNumber, setPhoneNumber] = useState('')
   const [isChatOpen, setIsChatOpen] = useState(false)
   const [chatInput, setChatInput] = useState('')
   const [chatMessages, setChatMessages] = useState([
@@ -2180,7 +2243,7 @@ function AgentTester() {
     onMessage: handleWsMessage,
     onOpen: () => {
       const normalizedCallerId = callerIdRef.current || window.localStorage?.getItem('voice_ai_caller_id') || 'anonymous'
-      wsSend(JSON.stringify({ type: 'session_start', caller_id: normalizedCallerId }))
+      wsSend(JSON.stringify({ type: 'session_start', caller_id: normalizedCallerId, agent_id: selectedConsoleAgent?.id, industry: selectedConsoleAgent?.industry }))
       setStatus('connected')
     },
     onClose: () => setStatus('ws closed'),
@@ -2190,9 +2253,9 @@ function AgentTester() {
   useEffect(() => {
     const normalized = callerId.trim()
     if (wsReadyState === WebSocket.OPEN && normalized) {
-      wsSend(JSON.stringify({ type: 'session_start', caller_id: normalized }))
+      wsSend(JSON.stringify({ type: 'session_start', caller_id: normalized, agent_id: selectedConsoleAgent?.id, industry: selectedConsoleAgent?.industry }))
     }
-  }, [callerId, wsReadyState, wsSend])
+  }, [callerId, selectedConsoleAgent?.id, selectedConsoleAgent?.industry, wsReadyState, wsSend])
 
   useEffect(() => {
     if (wsReadyState === WebSocket.CLOSED && reconnectAttempts > 0) {
@@ -2232,7 +2295,7 @@ function AgentTester() {
       const response = await fetch(`${apiBaseUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caller_id: callerId || 'anonymous', message }),
+        body: JSON.stringify({ caller_id: callerId || 'anonymous', message, agent_id: selectedConsoleAgent?.id, industry: selectedConsoleAgent?.industry }),
       })
       if (!response.ok) throw new Error(await response.text())
       return response.json()
@@ -2259,20 +2322,6 @@ function AgentTester() {
     sendChatMessage.mutate(message)
   }
 
-  const startOutboundCall = useMutation({
-    mutationFn: async () => {
-      if (!phoneNumber.trim()) throw new Error('Enter a phone number first.')
-      const response = await fetch(`${apiBaseUrl}/api/telephony/call`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone_number: phoneNumber.trim(), caller_id: callerId || 'dashboard' }),
-      })
-      if (!response.ok) throw new Error(await response.text())
-      return response.json()
-    },
-    onSuccess: (result) => setStatus(result.ok ? 'call queued' : result.reason || 'call needs config'),
-    onError: () => setStatus('call failed'),
-  })
 
   const startRecording = async () => {
     if (isRecording) return
@@ -2344,42 +2393,47 @@ function AgentTester() {
         lede="Test voice pipeline, RAG knowledge grounding, tool execution, and agent switching in real-time."
         meta="Multi-Agent Voice + Chat"
       />
-
-      {/* Active Persona Banner & Quick Switcher */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3.5 rounded-xl border bg-card/60 backdrop-blur-xs">
+      {/* Active Agent Banner & Live Browser Selector */}
+      <div className="flex flex-col gap-4 rounded-xl border bg-card/60 p-3.5 backdrop-blur-xs lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-primary/10 text-primary">
+          <div className="rounded-lg bg-primary/10 p-2 text-primary">
             <Robot size={22} weight="duotone" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs uppercase tracking-wider text-muted-foreground font-semibold">Active Live Brain:</span>
-              <span className="text-sm font-bold">{activeAgent?.name || activeAgent?.version || 'Default Agent'}</span>
-              <Badge variant="default" className="text-[10px] h-4 bg-emerald-600">Live</Badge>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Active Live Brain:</span>
+              <span className="text-sm font-bold">{selectedConsoleAgent?.name || 'Select an agent'}</span>
+              <Badge variant="default" className="h-4 bg-emerald-600 text-[10px]">Live</Badge>
             </div>
             <p className="text-xs text-muted-foreground">
-              {activeAgent?.domain || 'General'}  {activeAgent?.version}
+              {selectedIndustryMeta?.label || 'Industry'} / {selectedConsoleAgent?.organization || 'Organization'} / {selectedConsoleAgent?.serviceTool || 'service tool'}
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <span className="text-xs text-muted-foreground mr-1">Switch Agent:</span>
-          {prompts.map((p) => {
-            const isSelected = p.is_active
-            return (
-              <Button
-                key={p._id || p.version}
-                variant={isSelected ? 'default' : 'outline'}
-                size="sm"
-                className={`h-7 text-xs ${isSelected ? 'bg-primary text-primary-foreground' : ''}`}
-                onClick={() => switchAgentMutation.mutate(p._id || p.version)}
-                disabled={isSelected || switchAgentMutation.isPending}
-              >
-                {p.version?.includes('catla') ? 'Catla Helpdesk' : p.version?.includes('hospitals') ? 'One Hospitals' : (p.name?.slice(0, 14) || p.version)}
-              </Button>
-            )
-          })}
+        <div className="grid w-full gap-2 sm:grid-cols-2 lg:w-[520px]">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="console-industry">Industry Type</Label>
+            <select
+              id="console-industry"
+              value={selectedIndustry}
+              onChange={(event) => setSelectedIndustry(event.target.value)}
+              className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+            >
+              {INDUSTRIES.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="console-agent">Select Agent To Go Live</Label>
+            <select
+              id="console-agent"
+              value={selectedConsoleAgent?.id || ''}
+              onChange={(event) => setSelectedAgentId(event.target.value)}
+              className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+            >
+              {consoleAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+            </select>
+          </div>
         </div>
       </div>
 
@@ -2453,19 +2507,10 @@ function AgentTester() {
               <ChatCircle size={18} weight="duotone" /> {isChatOpen ? 'Hide chat' : 'Chat with agent'}
             </Button>
 
-            <div className="flex flex-col gap-1.5 opacity-80">
-              <Label htmlFor="phone-number">Outbound call</Label>
-              <Input
-                id="phone-number"
-                value={phoneNumber}
-                onChange={(event) => setPhoneNumber(event.target.value)}
-                placeholder="+91XXXXXXXXXX"
-              />
-              <p className="text-xs text-muted-foreground">Provider restrictions may block outbound on trial/KYC accounts.</p>
+            <div className="rounded-xl border bg-muted/20 p-3 text-xs text-muted-foreground">
+              <p className="font-semibold text-foreground mb-1">Outbound Calls</p>
+              <p>Outbound calls need telephony provider KYC and approved caller ID setup before live production dialing. Keep testing agents in browser voice/chat until that setup is complete.</p>
             </div>
-            <Button type="button" variant="outline" onClick={() => startOutboundCall.mutate()} disabled={startOutboundCall.isPending}>
-              <PhoneCall size={18} weight="duotone" /> {startOutboundCall.isPending ? 'Calling' : 'Initiate call'}
-            </Button>
           </CardContent>
         </Card>
 
@@ -2537,22 +2582,60 @@ function AgentTester() {
 }
 
 export default function App() {
+  const [authToken, setAuthToken] = useState(() => {
+    return typeof window !== 'undefined' ? window.localStorage?.getItem('voice_ai_admin_token') : null
+  })
+
+  // Enforce Login for the entire dashboard
+  if (!authToken) {
+    return (
+      <LoginView
+        onLoginSuccess={(data) => {
+          setAuthToken(data.access_token)
+        }}
+      />
+    )
+  }
+
   return (
     <Routes>
+      {/* Landing page is Overview */}
       <Route path="/" element={<Navigate to="/overview" replace />} />
       <Route path="/overview" element={<Overview />} />
+      
+      {/* Industry agent catalog */}
+      <Route
+        path="/agents"
+        element={
+          <AppShell title="Voice AI Agents">
+            <AgentsView onSelectAgentForMemory={(id) => (window.location.href = `/memory?agent=${id}`)} />
+          </AppShell>
+        }
+      />
+
+      {/* Upgraded graph memory (Memory, Tenant Rules, Agent Rules, Activity + Graph Visualizer) */}
+      <Route
+        path="/memory"
+        element={
+          <AppShell title="Graph Memory">
+            <MemoryCortexView />
+          </AppShell>
+        }
+      />
+
       <Route path="/interactions" element={<Interactions />} />
-      <Route path="/bookings" element={<Bookings />} />
-      <Route path="/calendar" element={<CalendarView />} />
       <Route path="/rag" element={<RagInspector />} />
       <Route path="/safety" element={<SafetyCenter />} />
-      <Route path="/handoffs" element={<Handoffs />} />
       <Route path="/tokens" element={<TokenMetrics />} />
+
+      <Route path="/agent" element={<AgentTester />} />
       <Route path="/prompts" element={<PromptLab />} />
       <Route path="/agent-config" element={<AgentConfiguration />} />
-      <Route path="/memory" element={<MemoryBrain />} />
+      <Route path="/bookings" element={<Bookings />} />
       <Route path="/platform" element={<PlatformLab />} />
-      <Route path="/agent" element={<AgentTester />} />
+
+      {/* Production SPA fallback: prevents 404 on refresh */}
+      <Route path="*" element={<Navigate to="/overview" replace />} />
     </Routes>
   )
 }

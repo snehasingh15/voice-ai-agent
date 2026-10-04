@@ -64,13 +64,29 @@ from .platform_operations import (
 )
 from .memory.cortex import (
     DEFAULT_MEMORY_POLICY,
+    _GRAPH_INDEX,
     delete_memory_cell,
+    get_agent_rules,
+    get_agents_directory,
     get_customer_memory_profile,
+    get_memory_activity,
     get_memory_policy,
+    get_tenant_memory_config,
+    get_tenant_rules,
     ingest_memory_turn,
     list_memory_cells,
+    remove_all_agent_overrides,
     retrieve_memory_context,
+    save_agent_rules,
     save_memory_policy,
+    save_tenant_memory_config,
+    save_tenant_rules,
+)
+from .telephony.plivo import (
+    generate_plivo_inbound_xml,
+    get_plivo_config,
+    initiate_plivo_outbound_call,
+    save_plivo_config,
 )
 from .pipeline.llm import generate_agent_reply, summarize_conversation
 from .pipeline.orchestrator import (
@@ -85,6 +101,63 @@ from .rag.ingest import extract_pdf_text, ingest_text
 from .rag.retriever import retrieve_relevant_documents
 
 # â”€â”€ App setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+LIVE_AGENT_CONTEXTS = {
+    "fore-school-counsellor": {"industry": "education", "name": "FORE School Counsellor", "organization": "FORE School of Management", "welcome": "Hello, am I speaking with {student_name}?", "service_tool": "create_service_booking for counsellor_discussion", "instructions": "Act as Priya, a warm admissions counsellor. Use registered student details when supplied, qualify PGDM-HHM interest, answer program questions, and book a counsellor discussion or callback only after date/time confirmation. Never claim brochure, callback, or booking completion until the tool succeeds."},
+    "apollo-health-patient": {"industry": "healthcare", "name": "Apollo Health Patient Assistant", "organization": "Apollo Health", "welcome": "Hi {{patient_name}}, I am calling from Apollo Health regarding your recent enquiry. Is this a good time to speak for a moment?", "service_tool": "create_service_booking for appointment_or_callback", "instructions": "Act as a warm patient representative. Understand patient intent, avoid diagnosis, protect sensitive data, and book appointment/callback only after confirmation and tool success."},
+    "fortis-consultancy-support": {"industry": "finance", "name": "Fortis Consultancy Support", "organization": "Fortis Consultancy", "welcome": "Hello, is this {caller_name} I am speaking with?", "service_tool": "create_service_booking for finance_consultation", "instructions": "Act as Neha for finance/accounting support. Triage tax, accounting, payroll, GST, or compliance needs and book a consultation/callback only after confirmation. Do not collect OTPs, passwords, or full card details."},
+    "pravaas-journey-travel": {"industry": "travel", "name": "Pravaas Journey Planner", "organization": "Pravaas Journey", "welcome": "Hello, is this {caller_name} I am speaking with?", "service_tool": "create_service_booking for travel_consultation", "instructions": "Act as a travel advisor. Capture destination, dates, budget, traveler count, and preferences, then book a planning callback only after confirmation and tool success."},
+    "aspirare-helpdesk": {"industry": "telecom", "name": "Aspirare Help Desk", "organization": "Aspirare", "welcome": "Hello, this is Aspirare Help Desk. How may I assist you today?", "service_tool": "create_service_booking for support_callback", "instructions": "Act as a concise telecom helpdesk assistant. Capture issue details, stay available until the customer clearly ends, and book escalation/callback only after confirmation and tool success."},
+}
+
+
+def _default_voice_agents() -> list[dict]:
+    rows = []
+    for agent_id, agent in LIVE_AGENT_CONTEXTS.items():
+        rows.append({
+            "id": agent_id,
+            "industry": agent["industry"],
+            "name": agent["name"],
+            "organization": agent["organization"],
+            "initials": "".join(word[0] for word in agent["name"].split()[:2]).upper(),
+            "languages": "English, Hindi, Hinglish",
+            "welcome": agent["welcome"],
+            "objective": agent["instructions"],
+            "serviceTool": agent["service_tool"].replace("create_service_booking for ", "service_booking: "),
+            "metadata": [],
+            "prompt": agent["instructions"],
+            "guardrails": ["Ask one question at a time", "Confirm before booking or callback", "Never claim tool success before the backend confirms it"],
+            "hangup": "End only after the caller clearly finishes or the configured task is completed with confirmation.",
+            "source": "default",
+        })
+    return rows
+
+
+def _agent_to_context(agent_id: str, agent: dict) -> str:
+    service_tool = agent.get("service_tool") or agent.get("serviceTool") or "create_service_booking"
+    instructions = agent.get("instructions") or agent.get("prompt") or agent.get("objective") or "Assist the caller professionally."
+    return (
+        f"Agent id: {agent_id}. Industry: {agent.get('industry', '')}. Name: {agent.get('name', agent_id)}. "
+        f"Organization: {agent.get('organization', '')}. Welcome message: {agent.get('welcome', '')}. "
+        f"Service tool: {service_tool}. Instructions: {instructions} "
+        "Recall caller memory when relevant, update useful preferences, ask one question at a time, and write bookings/callbacks through the service booking tool when the caller confirms date/time or callback details."
+    )
+
+
+def _selected_agent_context(agent_id: str | None) -> str:
+    clean_id = (agent_id or "").strip()
+    agent = LIVE_AGENT_CONTEXTS.get(clean_id)
+    if agent:
+        return _agent_to_context(clean_id, agent)
+    if clean_id:
+        try:
+            coll = get_db().get_collection("voice_agents")
+            doc = coll.find_one({"id": clean_id}) or coll.find_one({"_id": clean_id})
+            if doc:
+                return _agent_to_context(clean_id, doc)
+        except Exception as exc:
+            print(f"[agents][warning] could not load selected agent {clean_id}: {exc}")
+    return ""
+
 app = FastAPI(
     title="Voice AI â€“ Enterprise API",
     version="2.0.0",
@@ -210,7 +283,7 @@ def _serialize_doc(doc: dict) -> dict:
 def _add_uploaded_file_to_chat_history(caller_id: str, file_type: str, description: str) -> None:
     if not caller_id or not description:
         return
-    session_id = f"chat-{caller_id}"
+    session_id = f"chat-{caller_id}-{agent_id or 'default'}"
     append_session_message(session_id, "assistant", f"I analyzed the uploaded {file_type}. Description: {description}")
 
 
@@ -219,22 +292,33 @@ def _add_uploaded_file_to_chat_history(caller_id: str, file_type: str, descripti
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.post("/api/auth/login")
-@limiter.limit("10/minute")
+@limiter.limit("20/minute")
 async def login(request: Request):
-    """Issue a JWT Bearer token.  Body: { "password": "..." } """
+    """Issue a JWT Bearer token. Body: { "username": "admin", "password": "..." } or { "password": "..." }"""
     try:
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
+    username = (data.get("username") or data.get("login_id") or "admin").strip()
     password = (data.get("password") or "").strip()
     if not verify_password(password):
-        log_structured("auth_failed", "auth", level="WARNING", metadata={"ip": request.client.host if request.client else "unknown"})
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        log_structured("auth_failed", "auth", level="WARNING", metadata={"ip": request.client.host if request.client else "unknown", "username": username})
+        raise HTTPException(status_code=401, detail="Invalid login credentials")
 
-    token = create_access_token(subject="admin", role="admin")
-    log_structured("auth_success", "auth", metadata={"ip": request.client.host if request.client else "unknown"})
-    return {"access_token": token, "token_type": "bearer", "expires_in": 86400}
+    token = create_access_token(subject=username, role="admin")
+    log_structured("auth_success", "auth", metadata={"ip": request.client.host if request.client else "unknown", "username": username})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 86400,
+        "user": {
+            "username": username,
+            "role": "admin",
+            "tenant_id": "default",
+            "name": "Administrator",
+        },
+    }
 
 
 @app.get("/api/auth/verify")
@@ -264,19 +348,69 @@ async def observability_traces(limit: int = 50):
     """Recent OpenTelemetry-compatible distributed trace spans (STT / LLM / TTS)."""
     return get_recent_traces(limit=min(limit, 200))
 @app.get("/api/agent-config")
-async def read_agent_config():
-    """Current runtime configuration for LLM, STT, TTS, calling, tools, and extraction."""
-    return get_agent_config()
+async def read_agent_config(agent_id: str = ""):
+    """Current per-agent runtime configuration for LLM, STT, TTS, calling, tools, and extraction."""
+    return get_agent_config(agent_id or None)
 
 
 @app.patch("/api/agent-config")
-async def update_agent_config(payload: dict, admin: dict = Depends(get_current_admin)):
-    """Persist runtime agent configuration in MongoDB."""
+async def update_agent_config(payload: dict, agent_id: str = "", admin: dict = Depends(get_current_admin)):
+    """Persist runtime agent configuration in MongoDB for the selected agent."""
     try:
-        return save_agent_config(payload)
+        return save_agent_config(payload, agent_id=agent_id or payload.get("agent_id"))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
+
+
+@app.get("/api/voice-agents")
+async def list_voice_agents():
+    """List default and custom voice agents for the Agents tab."""
+    agents = {agent["id"]: agent for agent in _default_voice_agents()}
+    try:
+        docs = list(get_db().get_collection("voice_agents").find({}).sort("updatedAt", -1).limit(500))
+        for doc in docs:
+            doc = _serialize_doc(doc)
+            agent_id = doc.get("id") or doc.get("_id")
+            if agent_id:
+                doc["id"] = agent_id
+                doc["source"] = doc.get("source") or "custom"
+                agents[agent_id] = doc
+    except Exception as exc:
+        print(f"[agents][warning] using default catalog: {exc}")
+    return list(agents.values())
+
+
+@app.post("/api/voice-agents")
+async def create_voice_agent(payload: dict, admin: dict = Depends(get_current_admin)):
+    name = (payload.get("name") or "New Voice Agent").strip()
+    industry = (payload.get("industry") or "education").strip()
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-") or uuid.uuid4().hex[:10]
+    agent_id = (payload.get("id") or f"{industry}-{slug}").strip()
+    now = datetime.now(timezone.utc)
+    doc = {
+        **payload,
+        "_id": agent_id,
+        "id": agent_id,
+        "industry": industry,
+        "name": name,
+        "initials": payload.get("initials") or "".join(word[0] for word in name.split()[:2]).upper() or "AG",
+        "source": "custom",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    get_db().get_collection("voice_agents").update_one({"_id": agent_id}, {"$setOnInsert": doc}, upsert=True)
+    return _serialize_doc(get_db().get_collection("voice_agents").find_one({"_id": agent_id}) or doc)
+
+
+@app.patch("/api/voice-agents/{agent_id}")
+async def update_voice_agent(agent_id: str, payload: dict, admin: dict = Depends(get_current_admin)):
+    update = {k: v for k, v in payload.items() if k not in {"_id", "id", "createdAt"}}
+    update["updatedAt"] = datetime.now(timezone.utc)
+    update.setdefault("source", "custom")
+    get_db().get_collection("voice_agents").update_one({"_id": agent_id}, {"$set": update}, upsert=True)
+    doc = get_db().get_collection("voice_agents").find_one({"_id": agent_id}) or {"_id": agent_id, "id": agent_id, **update}
+    return _serialize_doc(doc)
 
 @app.get("/api/providers")
 async def provider_registry():
@@ -400,10 +534,12 @@ async def recent_telephony_events(admin: dict = Depends(get_current_admin)):
 async def chat_with_agent(payload: dict):
     caller_id = (payload.get("caller_id") or "anonymous").strip() or "anonymous"
     message = (payload.get("message") or "").strip()
+    agent_id = (payload.get("agent_id") or "").strip()
+    agent_context = _selected_agent_context(agent_id)
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
 
-    session_id = f"chat-{caller_id}"
+    session_id = f"chat-{caller_id}-{agent_id or 'default'}"
     history = get_session_history(session_id)
     caller_summary = get_caller_memory(caller_id)
     used_tools: list[str] = []
@@ -417,6 +553,7 @@ async def chat_with_agent(payload: dict):
             caller_summary=caller_summary,
             used_tools=used_tools,
             caller_id=caller_id,
+            agent_context=agent_context,
         )
         llm_latency_ms = (perf_counter() - llm_start) * 1000
 
@@ -500,17 +637,109 @@ async def prompt_injection_demo():
         "verdict": "Demo document inserted. The system prompt instructs the agent to treat RAG content as untrusted and never reveal secrets.",
     }
 
+@app.get("/api/memory/tenant-config")
 @app.get("/api/memory/policy")
-async def memory_policy(admin: dict = Depends(get_current_admin)):
-    return get_memory_policy()
+async def memory_tenant_config(admin: dict = Depends(get_current_admin)):
+    return get_tenant_memory_config()
 
 
+@app.patch("/api/memory/tenant-config")
 @app.patch("/api/memory/policy")
-async def update_memory_policy(payload: dict, admin: dict = Depends(get_current_admin)):
+async def update_memory_tenant_config(payload: dict, admin: dict = Depends(get_current_admin)):
     try:
-        return save_memory_policy(payload)
+        return save_tenant_memory_config(payload)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Memory policy store unavailable: {exc}")
+
+
+@app.get("/api/memory/tenant-rules")
+async def memory_tenant_rules(admin: dict = Depends(get_current_admin)):
+    return get_tenant_rules()
+
+
+@app.post("/api/memory/tenant-rules")
+async def update_memory_tenant_rules(payload: dict, admin: dict = Depends(get_current_admin)):
+    try:
+        rules = payload.get("rules") or []
+        return save_tenant_rules(rules)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Tenant rules save failed: {exc}")
+
+
+@app.get("/api/memory/agents")
+async def memory_agents(admin: dict = Depends(get_current_admin)):
+    return get_agents_directory()
+
+
+@app.get("/api/memory/agent-rules/{agent_id}")
+async def memory_agent_rules(agent_id: str, admin: dict = Depends(get_current_admin)):
+    return get_agent_rules(agent_id)
+
+
+@app.post("/api/memory/agent-rules/{agent_id}")
+async def update_memory_agent_rules(agent_id: str, payload: dict, admin: dict = Depends(get_current_admin)):
+    try:
+        overrides = payload.get("overrides") or {}
+        return save_agent_rules(agent_id, overrides)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Agent rules save failed: {exc}")
+
+
+@app.delete("/api/memory/agent-rules/{agent_id}")
+async def reset_memory_agent_rules(agent_id: str, admin: dict = Depends(get_current_admin)):
+    try:
+        return remove_all_agent_overrides(agent_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Agent rules reset failed: {exc}")
+
+
+@app.get("/api/memory/activity")
+async def memory_activity(limit: int = 50, admin: dict = Depends(get_current_admin)):
+    return get_memory_activity(limit=limit)
+
+
+@app.get("/api/memory/graph")
+async def memory_graph(admin: dict = Depends(get_current_admin)):
+    return _GRAPH_INDEX.get_graph_data()
+
+
+@app.get("/api/telephony/plivo/config")
+async def plivo_config(admin: dict = Depends(get_current_admin)):
+    return get_plivo_config()
+
+
+@app.patch("/api/telephony/plivo/config")
+async def update_plivo_config(payload: dict, admin: dict = Depends(get_current_admin)):
+    return save_plivo_config(payload)
+
+
+@app.post("/api/telephony/plivo/inbound")
+async def plivo_inbound_webhook(request: Request):
+    """Webhook handling incoming Plivo phone calls and returning Plivo XML."""
+    form_data = {}
+    try:
+        form_data = await request.form()
+    except Exception:
+        pass
+    from_num = str(form_data.get("From") or "")
+    call_uuid = str(form_data.get("CallUUID") or "")
+    xml_content = generate_plivo_inbound_xml(from_number=from_num, call_uuid=call_uuid, agent_id="reminder")
+    return Response(content=xml_content, media_type="application/xml")
+
+
+@app.post("/api/telephony/plivo/outbound")
+async def plivo_outbound_call(payload: dict, admin: dict = Depends(get_current_admin)):
+    to_number = payload.get("to_number") or payload.get("phone_number") or ""
+    if not to_number:
+        raise HTTPException(status_code=400, detail="to_number is required")
+    from_number = payload.get("from_number")
+    agent_id = payload.get("agent_id") or "reminder"
+    return initiate_plivo_outbound_call(to_number=to_number, from_number=from_number, agent_id=agent_id)
+
+
+@app.post("/api/telephony/plivo/status")
+async def plivo_status_callback(request: Request):
+    return {"ok": True, "received": True}
 
 
 @app.get("/api/memory/cells")
@@ -900,6 +1129,8 @@ async def websocket_session(websocket: WebSocket):
     mime = "audio/webm"
     caller_id: str | None = None
     session_id: str | None = None
+    selected_agent_id = ""
+    selected_agent_context = ""
 
     try:
         while True:
@@ -950,9 +1181,11 @@ async def websocket_session(websocket: WebSocket):
 
                 if msg_type == "session_start":
                     caller_id = (data.get("caller_id") or "anonymous").strip() or "anonymous"
+                    selected_agent_id = (data.get("agent_id") or "").strip()
+                    selected_agent_context = _selected_agent_context(selected_agent_id)
                     session_id = f"session-{caller_id}-{uuid.uuid4().hex[:10]}"
-                    log_structured("session_start", "ws", metadata={"caller_id": caller_id, "session_id": session_id})
-                    streaming_session_snapshot(session_id, "started", {"caller_id": caller_id})
+                    log_structured("session_start", "ws", metadata={"caller_id": caller_id, "session_id": session_id, "agent_id": selected_agent_id})
+                    streaming_session_snapshot(session_id, "started", {"caller_id": caller_id, "agent_id": selected_agent_id})
                     await websocket.send_json({"type": "status", "message": "session_started"})
                     caller_memory = get_caller_memory(caller_id)
                     if caller_memory:
@@ -992,6 +1225,7 @@ async def websocket_session(websocket: WebSocket):
                         session_id=session_id,
                         tool_event_callback=_tool_event,
                         trace_id=trace_id,
+                        agent_context=selected_agent_context,
                     )
 
                     await websocket.send_json({"type": "transcript", "text": transcript})
@@ -1133,5 +1367,24 @@ async def exotel_voicebot(websocket: WebSocket):
         log_structured("exotel_ws_error", "exotel", level="ERROR", metadata={"error": str(exc)})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SPA Fallback Catch-All Route (Prevents 404 on page refresh in production)
+# ─────────────────────────────────────────────────────────────────────────────
+from starlette.responses import FileResponse
 
 
+@app.get("/{full_path:path}")
+async def serve_spa_fallback(full_path: str):
+    """Fallback handler to ensure refreshing any route in production never throws 404."""
+    if full_path.startswith("api/") or full_path.startswith("ws/") or full_path in {"healthz", "docs", "openapi.json"}:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    dist_index = (Path(__file__).resolve().parents[2] / "frontend" / "dist" / "index.html").resolve()
+    if dist_index.exists():
+        return FileResponse(dist_index)
+
+    dev_index = (Path(__file__).resolve().parents[2] / "frontend" / "index.html").resolve()
+    if dev_index.exists():
+        return FileResponse(dev_index)
+
+    return {"ok": True, "service": "Voice AI API", "landing": "/overview", "requested": full_path}

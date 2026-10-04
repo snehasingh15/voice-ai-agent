@@ -95,6 +95,7 @@ async def handle_audio_turn(
     tool_event_callback: Any | None = None,
     trace_id: str | None = None,
     tts_renderer: Any | None = None,
+    agent_context: str | None = None,
 ) -> tuple:
     """Tie STT -> LLM agent -> TTS together with distributed tracing and state persistence."""
     current_trace_id = trace_id or str(uuid.uuid4())
@@ -142,6 +143,7 @@ async def handle_audio_turn(
                 caller_summary=caller_summary,
                 used_tools=used_tools,
                 caller_id=caller_id or "anonymous",
+                agent_context=agent_context,
             )
             llm_latency_ms = (perf_counter() - llm_start) * 1000
 
